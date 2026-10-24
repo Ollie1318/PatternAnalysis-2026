@@ -11,6 +11,9 @@ Current stages:
     3. compute_features:  per-step feature vectors for the "unconstrained" or
                           "constrained" representation (see its docstring).
     4. split_by_time:     chronological train / val / test split per ticker.
+    5. fit_minmax / apply_minmax / invert_minmax:
+                          [0, 1] scaling fitted on the training split only.
+    6. make_windows:      fixed-length sliding windows within each split.
 
 Each LOBSTER sample consists of two row-aligned CSV files without headers
 (see LOBSTER_SampleFiles_ReadMe.txt):
@@ -513,6 +516,137 @@ def split_by_time(features, boundaries=SPLIT_BOUNDARIES):
     return splits
 
 
+def fit_minmax(train_features, scope="global", quantile=0.005):
+    """
+    Fit per-feature min-max scaling statistics on the TRAINING split only.
+
+    Min-max to [0, 1] follows the TimeGAN paper and reference code, whose
+    networks end in a sigmoid. Val/test rows are scaled with the same
+    statistics and may fall slightly outside [0, 1]; no information from
+    those hours leaks into the scaling.
+
+    Robust bounds: instead of the true min/max, the bounds are the
+    quantile and 1 - quantile percentiles of the training data (default
+    0.5% / 99.5%). With true min/max, a few extreme returns set the range and
+    squash typical returns into ~10% of [0, 1] (measured: 98% of scaled AAPL
+    returns fell in [0.59, 0.69]). Values beyond the bounds land outside
+    [0, 1]; apply_minmax(clip=True) then winsorises them (replaces each with
+    the nearest bound, rows are never removed). quantile=0 recovers plain
+    min-max.
+
+    Scopes (the README must justify the choice, see CLAUDE.md "Normalisation"):
+        global      Option A: one min/max per feature, pooled over all tickers.
+                    Stocks keep their real differences (e.g. INTC's larger
+                    relative spread), so the model must learn ticker identity
+                    from the conditioning.
+        per_ticker  Option B: separate min/max per ticker. Every stock fills
+                    [0, 1], so conditioning must then be judged on
+                    level-free statistics after decoding.
+
+    Args:
+        train_features (dict[str, pd.DataFrame]): ticker -> training-split
+            output of split_by_time (a "time" column plus F features).
+        scope (str): "global" or "per_ticker".
+        quantile (float): lower percentile for the bounds, in [0, 0.5).
+
+    Returns:
+        dict[str, tuple[np.ndarray, np.ndarray]]: ticker -> (feature_min,
+        feature_max), each of shape (F,). Under "global" every ticker maps to
+        the same pair.
+
+    Raises:
+        ValueError: for an unknown scope or a quantile outside [0, 0.5).
+    """
+    if not 0 <= quantile < 0.5:
+        raise ValueError(f"quantile must be in [0, 0.5), got {quantile}")
+
+    def bounds(v):  # (T, F) -> two (F,) arrays
+        return np.quantile(v, quantile, axis=0), np.quantile(v, 1 - quantile, axis=0)
+
+    values = {
+        t: df.drop(columns="time").to_numpy()
+        for t, df in train_features.items()
+    }
+    if scope == "global":
+        pooled = np.concatenate(list(values.values()), axis=0)  # (sum T, F)
+        stats = bounds(pooled)
+        return {t: stats for t in values}
+    if scope == "per_ticker":
+        return {t: bounds(v) for t, v in values.items()}
+    raise ValueError(
+        f"unknown scope {scope!r}, expected 'global' or 'per_ticker'"
+    )
+
+
+def apply_minmax(values, feature_min, feature_max, clip=False, eps=1e-12):
+    """
+    Scale features to [0, 1] using fitted training statistics.
+
+    Args:
+        values (np.ndarray): (..., F) raw features.
+        feature_min, feature_max (np.ndarray): (F,) from fit_minmax.
+        clip (bool): winsorise results to [0, 1] (use for model inputs, which
+            a sigmoid-output generator could never reproduce anyway). Metrics
+            are computed on decoded real books, not on these clipped values.
+        eps (float): guards constant features (max == min) against division by 0.
+
+    Returns:
+        np.ndarray of the same shape, (values - min) / (max - min), clipped to
+        [0, 1] if clip is True.
+    """
+    scaled = (values - feature_min) / (feature_max - feature_min + eps)
+    return np.clip(scaled, 0.0, 1.0) if clip else scaled
+
+
+def invert_minmax(scaled, feature_min, feature_max, eps=1e-12):
+    """
+    Undo apply_minmax: map scaled features back to raw feature units.
+
+    Args:
+        scaled (np.ndarray): (..., F) scaled features (e.g. generator output).
+        feature_min, feature_max (np.ndarray): (F,) from fit_minmax.
+        eps (float): must match the value used in apply_minmax.
+
+    Returns:
+        np.ndarray of the same shape in raw feature units.
+    """
+    return scaled * (feature_max - feature_min + eps) + feature_min
+
+
+def make_windows(values, seq_len, stride=1):
+    """
+    Cut one split of one ticker into overlapping fixed-length windows.
+
+    Called separately on each split, so no window can cross a split boundary.
+    Stride 1 matches the sliding windows of the TimeGAN reference code
+    (data_loading.py), but unlike that code, windows are NOT shuffled across
+    periods before splitting: the split is chronological first.
+
+    Args:
+        values (np.ndarray): (T, F) scaled features of one split, in time order.
+        seq_len (int): window length L (e.g. 100-128 for training).
+        stride (int): step between window starts.
+
+    Returns:
+        np.ndarray of shape (n_windows, seq_len, F), with
+        n_windows = (T - seq_len) // stride + 1. Window j covers rows
+        j * stride .. j * stride + seq_len - 1.
+
+    Raises:
+        ValueError: if seq_len or stride is not positive, or T < seq_len.
+    """
+    if seq_len < 1 or stride < 1:
+        raise ValueError(
+            f"seq_len and stride must be positive, got {seq_len}, {stride}"
+        )
+    if len(values) < seq_len:
+        raise ValueError(
+            f"split has {len(values)} rows, fewer than seq_len={seq_len}"
+        )
+    starts = np.arange(0, len(values) - seq_len + 1, stride)  # (n_windows,)
+    return np.stack([values[s : s + seq_len] for s in starts])
+
+
 def main():
     """Print a short summary of each ticker before and after resampling, as a quick check."""
     parser = argparse.ArgumentParser(
@@ -539,8 +673,17 @@ def main():
         default="unconstrained",
         help="feature encoding (default: unconstrained)",
     )
+    parser.add_argument(
+        "--scope",
+        choices=("global", "per_ticker"),
+        default="global",
+        help="min-max normalisation scope (default: global)",
+    )
+    parser.add_argument("--seq-len", type=int, default=24, help="window length")
+    parser.add_argument("--stride", type=int, default=1, help="window stride")
     args = parser.parse_args()
 
+    all_splits = {}
     for ticker in args.tickers:
         df = load_ticker(args.data_dir, ticker)
         price_cols = [c for c in df.columns if "price" in c]
@@ -578,6 +721,25 @@ def main():
                 for name, part in splits.items()
             )
         )
+        all_splits[ticker] = splits
+
+    stats = fit_minmax(
+        {t: s["train"] for t, s in all_splits.items()}, scope=args.scope
+    )
+    print(
+        f"\n{args.scope} min-max fitted on train; windows of {args.seq_len}, stride {args.stride}:"
+    )
+    for ticker, splits in all_splits.items():
+        parts = []
+        for name, part in splits.items():
+            raw = part.drop(columns="time").to_numpy()
+            scaled = apply_minmax(raw, *stats[ticker])
+            clipped = np.mean((scaled < 0) | (scaled > 1))
+            windows = make_windows(
+                apply_minmax(raw, *stats[ticker], clip=True), args.seq_len, args.stride
+            )
+            parts.append(f"{name} {windows.shape} ({clipped:.1%} values clipped)")
+        print(f"  {ticker}: " + ", ".join(parts))
 
 
 if __name__ == "__main__":
