@@ -4,8 +4,13 @@ Data loading and preprocessing for LOBSTER Level 10 limit order books.
 This module turns the raw LOBSTER sample files for the five tickers (AMZN, AAPL,
 GOOG, INTC, MSFT; 2012-06-21) into training windows for the conditional TimeGAN.
 
-Current stage: loading a single ticker. Each LOBSTER sample consists of two
-row-aligned CSV files without headers (see LOBSTER_SampleFiles_ReadMe.txt):
+Current stages:
+    1. load_ticker:       raw event-time book for one ticker, prices in dollars.
+    2. resample_to_grid:  regular clock-time grid (default 1 s), last book state
+                          at or before each grid time (no look-ahead).
+
+Each LOBSTER sample consists of two row-aligned CSV files without headers
+(see LOBSTER_SampleFiles_ReadMe.txt):
 
     *_message_10.csv    (N, 6):  time, event_type, order_id, size, price, direction
     *_orderbook_10.csv  (N, 40): ask_price_i, ask_size_i, bid_price_i, bid_size_i
@@ -27,7 +32,6 @@ import os
 import numpy as np
 import pandas as pd
 
-
 TICKERS = ("AMZN", "AAPL", "GOOG", "INTC", "MSFT")
 N_LEVELS = 10
 
@@ -38,7 +42,18 @@ PRICE_SCALE = 10_000
 DUMMY_ASK_PRICE = 9_999_999_999
 DUMMY_BID_PRICE = -9_999_999_999
 
-MESSAGE_COLUMNS = ["time", "event_type", "order_id", "size", "price", "direction"]
+MESSAGE_COLUMNS = [
+    "time",
+    "event_type",
+    "order_id",
+    "size",
+    "price",
+    "direction",
+]
+
+# Regular NASDAQ session in seconds after midnight: 09:30:00 and 16:00:00.
+MARKET_OPEN = 34_200.0
+MARKET_CLOSE = 57_600.0
 
 
 def orderbook_columns(n_levels=N_LEVELS):
@@ -54,7 +69,12 @@ def orderbook_columns(n_levels=N_LEVELS):
     """
     columns = []
     for i in range(1, n_levels + 1):
-        columns += [f"ask_price_{i}", f"ask_size_{i}", f"bid_price_{i}", f"bid_size_{i}"]
+        columns += [
+            f"ask_price_{i}",
+            f"ask_size_{i}",
+            f"bid_price_{i}",
+            f"bid_size_{i}",
+        ]
     return columns
 
 
@@ -121,13 +141,21 @@ def load_ticker(data_dir, ticker, n_levels=N_LEVELS):
         ValueError: if the two files are misaligned, timestamps go backwards,
             or a dummy level has a non-zero size.
     """
-    message_path, orderbook_path = find_lobster_files(data_dir, ticker, n_levels)
+    message_path, orderbook_path = find_lobster_files(
+        data_dir, ticker, n_levels
+    )
 
     messages = pd.read_csv(
-        message_path, header=None, names=MESSAGE_COLUMNS, usecols=["time", "event_type"]
+        message_path,
+        header=None,
+        names=MESSAGE_COLUMNS,
+        usecols=["time", "event_type"],
     )
     book = pd.read_csv(
-        orderbook_path, header=None, names=orderbook_columns(n_levels), dtype=np.int64
+        orderbook_path,
+        header=None,
+        names=orderbook_columns(n_levels),
+        dtype=np.int64,
     )
 
     if len(messages) != len(book):
@@ -135,7 +163,9 @@ def load_ticker(data_dir, ticker, n_levels=N_LEVELS):
             f"{ticker}: message file has {len(messages)} rows but orderbook has {len(book)}"
         )
     if not messages["time"].is_monotonic_increasing:
-        raise ValueError(f"{ticker}: message timestamps are not in chronological order")
+        raise ValueError(
+            f"{ticker}: message timestamps are not in chronological order"
+        )
 
     ask_price_cols = [f"ask_price_{i}" for i in range(1, n_levels + 1)]
     bid_price_cols = [f"bid_price_{i}" for i in range(1, n_levels + 1)]
@@ -143,14 +173,20 @@ def load_ticker(data_dir, ticker, n_levels=N_LEVELS):
     bid_size_cols = [f"bid_size_{i}" for i in range(1, n_levels + 1)]
 
     # Find dummy levels on the raw integers, before any float conversion.
-    ask_dummy = book[ask_price_cols].to_numpy() == DUMMY_ASK_PRICE  # (N, n_levels)
-    bid_dummy = book[bid_price_cols].to_numpy() == DUMMY_BID_PRICE  # (N, n_levels)
+    ask_dummy = (
+        book[ask_price_cols].to_numpy() == DUMMY_ASK_PRICE
+    )  # (N, n_levels)
+    bid_dummy = (
+        book[bid_price_cols].to_numpy() == DUMMY_BID_PRICE
+    )  # (N, n_levels)
 
     # LOBSTER documents that dummy levels carry size 0; fail loudly if not.
     if (book[ask_size_cols].to_numpy()[ask_dummy] != 0).any() or (
         book[bid_size_cols].to_numpy()[bid_dummy] != 0
     ).any():
-        raise ValueError(f"{ticker}: found a dummy price level with non-zero size")
+        raise ValueError(
+            f"{ticker}: found a dummy price level with non-zero size"
+        )
 
     price_cols = ask_price_cols + bid_price_cols
     book[price_cols] = book[price_cols].astype(np.float64) / PRICE_SCALE
@@ -160,12 +196,90 @@ def load_ticker(data_dir, ticker, n_levels=N_LEVELS):
     return pd.concat([messages, book], axis=1)
 
 
+def resample_to_grid(events, step=1.0, start=MARKET_OPEN, end=MARKET_CLOSE):
+    """
+    Sample an event-time book on a regular clock-time grid.
+
+    Grid times are t_k = start + k * step for k = 1..K, with K = (end - start) / step,
+    so the grid covers (start, end] and the first point is one step after start.
+    The book at t_k is the state after the last message with time <= t_k
+    (searchsorted with side="right", so ties take the last message at that
+    timestamp). Only past and present messages are used: no look-ahead.
+
+    If no message arrives in (t_{k-1}, t_k], the previous state is carried
+    forward; n_events records how often this happens. Trading halts (none in the
+    2012-06-21 samples) would also be carried forward, as LOBSTER duplicates the
+    book on halt messages.
+
+    Trimming the auction minutes is done by passing a later start / earlier end.
+
+    Args:
+        events (pd.DataFrame): output of load_ticker, shape (N, 2 + 4 * n_levels),
+            sorted by time.
+        step (float): grid spacing in seconds (e.g. 1, 2 or 5).
+        start (float): grid origin in seconds after midnight (excluded).
+        end (float): last grid time in seconds after midnight (included);
+            end - start must be a whole number of steps.
+
+    Returns:
+        pd.DataFrame of shape (K, 2 + 4 * n_levels). Columns:
+            time      float64  grid time t_k, seconds after midnight
+            n_events  int64    number of messages in (t_{k-1}, t_k]
+            ask_price_i, ask_size_i, bid_price_i, bid_size_i  as in load_ticker
+
+    Raises:
+        ValueError: if step is not positive, end - start is not a multiple of
+            step, or the first grid time comes before the first message (the
+            book would be undefined there).
+    """
+    if step <= 0:
+        raise ValueError(f"step must be positive, got {step}")
+    n_steps = int(round((end - start) / step))
+    if n_steps < 1 or not np.isclose(start + n_steps * step, end):
+        raise ValueError(
+            f"end - start = {end - start} s is not a whole number of {step} s steps"
+        )
+
+    grid = start + step * np.arange(1, n_steps + 1)  # (K,)
+    times = events["time"].to_numpy()  # (N,)
+
+    # Index of the last message at or before each grid time; -1 means none yet.
+    last_idx = np.searchsorted(times, grid, side="right") - 1  # (K,)
+    if last_idx[0] < 0:
+        raise ValueError(
+            f"first grid time {grid[0]:.3f} s is before the first message at {times[0]:.3f} s"
+        )
+
+    # Messages in each interval (t_{k-1}, t_k], with t_0 = start.
+    edges = np.concatenate([[start], grid])  # (K + 1,)
+    n_events = np.diff(np.searchsorted(times, edges, side="right"))  # (K,)
+
+    book_cols = [c for c in events.columns if c.startswith(("ask_", "bid_"))]
+    grid_book = events[book_cols].iloc[last_idx].reset_index(drop=True)
+    grid_book.insert(0, "n_events", n_events)
+    grid_book.insert(0, "time", grid)
+    return grid_book
+
+
 def main():
-    """Print a short summary of each loaded ticker, as a quick loader check."""
-    parser = argparse.ArgumentParser(description="Load LOBSTER Level 10 sample files.")
-    parser.add_argument("--data-dir", required=True, help="folder holding the LOBSTER CSVs")
+    """Print a short summary of each ticker before and after resampling, as a quick check."""
+    parser = argparse.ArgumentParser(
+        description="Load and resample LOBSTER Level 10 sample files."
+    )
     parser.add_argument(
-        "--tickers", nargs="+", default=list(TICKERS), help="tickers to load (default: all five)"
+        "--data-dir", required=True, help="folder holding the LOBSTER CSVs"
+    )
+    parser.add_argument(
+        "--tickers",
+        nargs="+",
+        default=list(TICKERS),
+        help="tickers to load (default: all five)",
+    )
+    parser.add_argument(
+        "--step",
+        type=float,
+        default=1.0,
+        help="grid step in seconds (default: 1)",
     )
     args = parser.parse_args()
 
@@ -180,6 +294,14 @@ def main():
             f"time {df['time'].iloc[0]:.3f}-{df['time'].iloc[-1]:.3f} s, "
             f"dummy price cells {n_dummy}, halts {n_halts}, "
             f"first best bid/ask ${first['bid_price_1']:.2f}/${first['ask_price_1']:.2f}"
+        )
+
+        grid = resample_to_grid(df, step=args.step)
+        mid = (grid["ask_price_1"] + grid["bid_price_1"]) / 2
+        print(
+            f"      {args.step:g} s grid: {len(grid)} steps, "
+            f"steps with no messages {(grid['n_events'] == 0).mean():.1%}, "
+            f"zero mid-price changes {(mid.diff(periods=1).iloc[1:] == 0).mean():.1%}"
         )
 
 
