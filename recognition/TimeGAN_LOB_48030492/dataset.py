@@ -8,6 +8,8 @@ Current stages:
     1. load_ticker:       raw event-time book for one ticker, prices in dollars.
     2. resample_to_grid:  regular clock-time grid (default 1 s), last book state
                           at or before each grid time (no look-ahead).
+    3. compute_features:  per-step feature vectors for the "unconstrained" or
+                          "constrained" representation (see its docstring).
 
 Each LOBSTER sample consists of two row-aligned CSV files without headers
 (see LOBSTER_SampleFiles_ReadMe.txt):
@@ -54,6 +56,9 @@ MESSAGE_COLUMNS = [
 # Regular NASDAQ session in seconds after midnight: 09:30:00 and 16:00:00.
 MARKET_OPEN = 34_200.0
 MARKET_CLOSE = 57_600.0
+
+# Feature encodings of the book (the penalty-loss variant reuses "unconstrained").
+REPRESENTATIONS = ("unconstrained", "constrained")
 
 
 def orderbook_columns(n_levels=N_LEVELS):
@@ -261,6 +266,188 @@ def resample_to_grid(events, step=1.0, start=MARKET_OPEN, end=MARKET_CLOSE):
     return grid_book
 
 
+def level_columns(name, n_levels=N_LEVELS):
+    """
+    Per-level column names, e.g. level_columns("ask_price", 3)
+    -> ["ask_price_1", "ask_price_2", "ask_price_3"].
+
+    Args:
+        name (str): column stem.
+        n_levels (int): number of levels.
+
+    Returns:
+        list[str] of length n_levels.
+    """
+    return [f"{name}_{i}" for i in range(1, n_levels + 1)]
+
+
+def feature_columns(representation, n_levels=N_LEVELS):
+    """
+    Names of the feature columns for a representation, in model-input order.
+
+    unconstrained (1 + 4 * n_levels = 41 features):
+        mid_log_return, ask_offset_1..n, bid_offset_1..n,
+        ask_log_size_1..n, bid_log_size_1..n
+    constrained (4 * n_levels = 40 features):
+        mid_log_return, log_spread, ask_log_gap_1..n-1, bid_log_gap_1..n-1,
+        ask_log_size_1..n, bid_log_size_1..n
+
+    Args:
+        representation (str): one of REPRESENTATIONS.
+        n_levels (int): book depth.
+
+    Returns:
+        list[str] of feature names.
+
+    Raises:
+        ValueError: for an unknown representation.
+    """
+    if representation == "unconstrained":
+        price_cols = level_columns("ask_offset", n_levels) + level_columns(
+            "bid_offset", n_levels
+        )
+    elif representation == "constrained":
+        price_cols = (
+            ["log_spread"]
+            + level_columns("ask_log_gap", n_levels - 1)
+            + level_columns("bid_log_gap", n_levels - 1)
+        )
+    else:
+        raise ValueError(
+            f"unknown representation {representation!r}, expected one of {REPRESENTATIONS}"
+        )
+    return (
+        ["mid_log_return"]
+        + price_cols
+        + level_columns("ask_log_size", n_levels)
+        + level_columns("bid_log_size", n_levels)
+    )
+
+
+def check_book(grid, n_levels=N_LEVELS):
+    """
+    Verify a gridded real book is complete and satisfies the order-book invariants.
+
+    Real LOBSTER books should always pass; this guards the feature encoding,
+    which takes logs of sizes, spreads and level gaps and so needs them positive.
+
+    Checks:
+        - no empty (dummy, NaN) price levels: there is no fill policy yet
+        - every size >= 1 share
+        - positive spread:       bid_price_1 < ask_price_1
+        - monotonic ladders:     ask prices strictly increase with level,
+                                 bid prices strictly decrease with level
+
+    Args:
+        grid (pd.DataFrame): output of resample_to_grid, shape (K, 2 + 4 * n_levels).
+        n_levels (int): book depth.
+
+    Raises:
+        ValueError: naming the first check that fails.
+    """
+    ask = grid[level_columns("ask_price", n_levels)].to_numpy()  # (K, n_levels)
+    bid = grid[level_columns("bid_price", n_levels)].to_numpy()  # (K, n_levels)
+    sizes = grid[
+        level_columns("ask_size", n_levels) + level_columns("bid_size", n_levels)
+    ].to_numpy()  # (K, 2 * n_levels)
+
+    if np.isnan(ask).any() or np.isnan(bid).any():
+        raise ValueError("book has empty (dummy) price levels; no fill policy is defined")
+    if (sizes < 1).any():
+        raise ValueError("book has a level with size < 1")
+    if (ask[:, 0] <= bid[:, 0]).any():
+        raise ValueError("book is crossed or locked (bid_price_1 >= ask_price_1)")
+    if (np.diff(ask, axis=1) <= 0).any() or (np.diff(bid, axis=1) >= 0).any():
+        raise ValueError("book has a non-monotonic price ladder")
+
+
+def compute_features(grid, representation="unconstrained", n_levels=N_LEVELS):
+    """
+    Encode a gridded book as per-step feature vectors.
+
+    Notation at grid step k: ask prices a_i, bid prices b_i, sizes va_i, vb_i
+    (level i = 1..n), mid m_k = (a_1 + b_1) / 2.
+
+    Shared features (both representations):
+        mid_log_return   r_k = log(m_k / m_{k-1})
+                         The spec's log-return transform; scale-free, so
+                         returns are comparable across tickers.
+        *_log_size_i     log(v_i). Sizes are >= 1 share (check_book), so the log
+                         is finite; it compresses the heavy-tailed size
+                         distribution. Decoding with exp() can never give a
+                         negative size, in either representation.
+
+    unconstrained, price features relative to the mid (dimensionless):
+        ask_offset_i     (a_i - m_k) / m_k      > 0 for real books
+        bid_offset_i     (b_i - m_k) / m_k      < 0 for real books
+        Decoding: a_i = m_k (1 + ask_offset_i). Nothing forces the decoded
+        ladder to be monotonic or the spread to be positive, so a model must
+        *learn* the invariants (the dilemma being tested).
+
+    constrained, all price features are logs of positive quantities:
+        log_spread       log((a_1 - b_1) / m_k)
+        ask_log_gap_i    log((a_{i+1} - a_i) / m_k),  i = 1..n-1
+        bid_log_gap_i    log((b_i - b_{i+1}) / m_k),  i = 1..n-1
+        Decoding: a_1 = m_k (1 + s/2), b_1 = m_k (1 - s/2) with s = exp(log_spread),
+        then a_{i+1} = a_i + m_k exp(ask_log_gap_i) and
+        b_{i+1} = b_i - m_k exp(bid_log_gap_i). Every exp() is positive, so
+        any feature vector decodes to a positive spread and strictly monotonic
+        ladders: the invariants hold by construction.
+
+    Prices are divided by the mid so that a $27 stock (INTC) and a $580 stock
+    (GOOG) give features on comparable scales; the price level itself only
+    enters through the anchor mid used when decoding.
+
+    The first grid step is dropped because r_k needs m_{k-1}. To decode a
+    sequence starting at row j, anchor on the real mid of the step before it.
+
+    Args:
+        grid (pd.DataFrame): output of resample_to_grid, shape (K, 2 + 4 * n_levels).
+        representation (str): one of REPRESENTATIONS.
+        n_levels (int): book depth.
+
+    Returns:
+        pd.DataFrame of shape (K - 1, 1 + F): a "time" column (grid time of
+        step k, seconds after midnight) followed by the F float64 features
+        named by feature_columns(representation, n_levels)
+        (F = 41 unconstrained, 40 constrained).
+
+    Raises:
+        ValueError: for an unknown representation, or if check_book fails.
+    """
+    columns = feature_columns(representation, n_levels)
+    check_book(grid, n_levels)
+
+    ask = grid[level_columns("ask_price", n_levels)].to_numpy()  # (K, n_levels)
+    bid = grid[level_columns("bid_price", n_levels)].to_numpy()  # (K, n_levels)
+    ask_size = grid[level_columns("ask_size", n_levels)].to_numpy()  # (K, n_levels)
+    bid_size = grid[level_columns("bid_size", n_levels)].to_numpy()  # (K, n_levels)
+    mid = (ask[:, 0] + bid[:, 0]) / 2  # (K,)
+
+    mid_log_return = np.diff(np.log(mid))  # (K - 1,), r_k for k = 1..K-1
+
+    # Drop step 0 so every remaining row has a return.
+    ask, bid, ask_size, bid_size, mid = (
+        x[1:] for x in (ask, bid, ask_size, bid_size, mid)
+    )
+    m = mid[:, None]  # (K - 1, 1), broadcasts across levels
+
+    if representation == "unconstrained":
+        price_features = [(ask - m) / m, (bid - m) / m]  # 2 x (K - 1, n_levels)
+    else:
+        spread = (ask[:, :1] - bid[:, :1]) / m  # (K - 1, 1)
+        ask_gap = np.diff(ask, axis=1) / m  # (K - 1, n_levels - 1)
+        bid_gap = -np.diff(bid, axis=1) / m  # (K - 1, n_levels - 1)
+        price_features = [np.log(spread), np.log(ask_gap), np.log(bid_gap)]
+
+    values = np.column_stack(
+        [mid_log_return, *price_features, np.log(ask_size), np.log(bid_size)]
+    )  # (K - 1, F)
+    features = pd.DataFrame(values, columns=columns)
+    features.insert(0, "time", grid["time"].to_numpy()[1:])
+    return features
+
+
 def main():
     """Print a short summary of each ticker before and after resampling, as a quick check."""
     parser = argparse.ArgumentParser(
@@ -280,6 +467,12 @@ def main():
         type=float,
         default=1.0,
         help="grid step in seconds (default: 1)",
+    )
+    parser.add_argument(
+        "--representation",
+        choices=REPRESENTATIONS,
+        default="unconstrained",
+        help="feature encoding (default: unconstrained)",
     )
     args = parser.parse_args()
 
@@ -302,6 +495,14 @@ def main():
             f"      {args.step:g} s grid: {len(grid)} steps, "
             f"steps with no messages {(grid['n_events'] == 0).mean():.1%}, "
             f"zero mid-price changes {(mid.diff(periods=1).iloc[1:] == 0).mean():.1%}"
+        )
+
+        features = compute_features(grid, representation=args.representation)
+        values = features.drop(columns="time").to_numpy()
+        print(
+            f"      {args.representation} features: {values.shape[0]} steps x "
+            f"{values.shape[1]} features, all finite {np.isfinite(values).all()}, "
+            f"range [{values.min():.3g}, {values.max():.3g}]"
         )
 
 
