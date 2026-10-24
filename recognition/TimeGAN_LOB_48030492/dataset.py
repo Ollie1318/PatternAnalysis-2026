@@ -10,6 +10,7 @@ Current stages:
                           at or before each grid time (no look-ahead).
     3. compute_features:  per-step feature vectors for the "unconstrained" or
                           "constrained" representation (see its docstring).
+    4. split_by_time:     chronological train / val / test split per ticker.
 
 Each LOBSTER sample consists of two row-aligned CSV files without headers
 (see LOBSTER_SampleFiles_ReadMe.txt):
@@ -56,6 +57,14 @@ MESSAGE_COLUMNS = [
 # Regular NASDAQ session in seconds after midnight: 09:30:00 and 16:00:00.
 MARKET_OPEN = 34_200.0
 MARKET_CLOSE = 57_600.0
+
+# Chronological splits as (lower, upper] in seconds after midnight:
+# train 09:30-14:00, validation 14:00-15:00, test 15:00-16:00.
+SPLIT_BOUNDARIES = {
+    "train": (MARKET_OPEN, 50_400.0),
+    "val": (50_400.0, 54_000.0),
+    "test": (54_000.0, MARKET_CLOSE),
+}
 
 # Feature encodings of the book (the penalty-loss variant reuses "unconstrained").
 REPRESENTATIONS = ("unconstrained", "constrained")
@@ -348,15 +357,20 @@ def check_book(grid, n_levels=N_LEVELS):
     ask = grid[level_columns("ask_price", n_levels)].to_numpy()  # (K, n_levels)
     bid = grid[level_columns("bid_price", n_levels)].to_numpy()  # (K, n_levels)
     sizes = grid[
-        level_columns("ask_size", n_levels) + level_columns("bid_size", n_levels)
+        level_columns("ask_size", n_levels)
+        + level_columns("bid_size", n_levels)
     ].to_numpy()  # (K, 2 * n_levels)
 
     if np.isnan(ask).any() or np.isnan(bid).any():
-        raise ValueError("book has empty (dummy) price levels; no fill policy is defined")
+        raise ValueError(
+            "book has empty (dummy) price levels; no fill policy is defined"
+        )
     if (sizes < 1).any():
         raise ValueError("book has a level with size < 1")
     if (ask[:, 0] <= bid[:, 0]).any():
-        raise ValueError("book is crossed or locked (bid_price_1 >= ask_price_1)")
+        raise ValueError(
+            "book is crossed or locked (bid_price_1 >= ask_price_1)"
+        )
     if (np.diff(ask, axis=1) <= 0).any() or (np.diff(bid, axis=1) >= 0).any():
         raise ValueError("book has a non-monotonic price ladder")
 
@@ -420,8 +434,12 @@ def compute_features(grid, representation="unconstrained", n_levels=N_LEVELS):
 
     ask = grid[level_columns("ask_price", n_levels)].to_numpy()  # (K, n_levels)
     bid = grid[level_columns("bid_price", n_levels)].to_numpy()  # (K, n_levels)
-    ask_size = grid[level_columns("ask_size", n_levels)].to_numpy()  # (K, n_levels)
-    bid_size = grid[level_columns("bid_size", n_levels)].to_numpy()  # (K, n_levels)
+    ask_size = grid[
+        level_columns("ask_size", n_levels)
+    ].to_numpy()  # (K, n_levels)
+    bid_size = grid[
+        level_columns("bid_size", n_levels)
+    ].to_numpy()  # (K, n_levels)
     mid = (ask[:, 0] + bid[:, 0]) / 2  # (K,)
 
     mid_log_return = np.diff(np.log(mid))  # (K - 1,), r_k for k = 1..K-1
@@ -446,6 +464,53 @@ def compute_features(grid, representation="unconstrained", n_levels=N_LEVELS):
     features = pd.DataFrame(values, columns=columns)
     features.insert(0, "time", grid["time"].to_numpy()[1:])
     return features
+
+
+def split_by_time(features, boundaries=SPLIT_BOUNDARIES):
+    """
+    Split one ticker's feature rows chronologically into train / val / test.
+
+    A row with grid time t belongs to the split whose interval (lower, upper]
+    contains t. With the default boundaries:
+        train  (09:30, 14:00]
+        val    (14:00, 15:00]
+        test   (15:00, 16:00]
+
+    No look-ahead: each row only uses book states at or before its own time
+    (the first val row's return uses the 14:00:00 mid, which is in the past).
+    Splitting happens *before* windowing and normalisation, so windows cannot
+    straddle a boundary and normalisation can be fitted on train only.
+
+    Args:
+        features (pd.DataFrame): output of compute_features, with a "time"
+            column in seconds after midnight, shape (K - 1, 1 + F).
+        boundaries (dict[str, tuple[float, float]]): split name ->
+            (lower, upper] in seconds after midnight; intervals must not overlap.
+
+    Returns:
+        dict[str, pd.DataFrame]: split name -> rows in that interval, each
+        with a fresh 0-based index and the same columns as features.
+
+    Raises:
+        ValueError: if the intervals overlap, or a row falls in no split.
+    """
+    intervals = sorted(boundaries.values())
+    for (_, upper), (lower, _) in zip(intervals, intervals[1:]):
+        if lower < upper:
+            raise ValueError(f"split intervals overlap: {boundaries}")
+
+    time = features["time"]
+    splits = {}
+    assigned = np.zeros(len(features), dtype=bool)
+    for name, (lower, upper) in boundaries.items():
+        in_split = ((time > lower) & (time <= upper)).to_numpy()
+        splits[name] = features[in_split].reset_index(drop=True)
+        assigned |= in_split
+    if not assigned.all():
+        raise ValueError(
+            f"{(~assigned).sum()} rows fall outside every split interval"
+        )
+    return splits
 
 
 def main():
@@ -503,6 +568,15 @@ def main():
             f"      {args.representation} features: {values.shape[0]} steps x "
             f"{values.shape[1]} features, all finite {np.isfinite(values).all()}, "
             f"range [{values.min():.3g}, {values.max():.3g}]"
+        )
+
+        splits = split_by_time(features)
+        print(
+            "      splits: "
+            + ", ".join(
+                f"{name} {len(part)} ({part['time'].iloc[0]:.0f}-{part['time'].iloc[-1]:.0f} s)"
+                for name, part in splits.items()
+            )
         )
 
 
