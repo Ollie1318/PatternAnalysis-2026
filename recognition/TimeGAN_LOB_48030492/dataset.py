@@ -14,6 +14,9 @@ Current stages:
     5. fit_minmax / apply_minmax / invert_minmax:
                           [0, 1] scaling fitted on the training split only.
     6. make_windows:      fixed-length sliding windows within each split.
+    7. build_datasets / LOBWindowDataset / make_dataloader:
+                          the full pipeline for all tickers, giving
+                          (window, ticker_id) samples with tickers mixed.
 
 Each LOBSTER sample consists of two row-aligned CSV files without headers
 (see LOBSTER_SampleFiles_ReadMe.txt):
@@ -37,6 +40,8 @@ import os
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 TICKERS = ("AMZN", "AAPL", "GOOG", "INTC", "MSFT")
 N_LEVELS = 10
@@ -561,7 +566,9 @@ def fit_minmax(train_features, scope="global", quantile=0.005):
         raise ValueError(f"quantile must be in [0, 0.5), got {quantile}")
 
     def bounds(v):  # (T, F) -> two (F,) arrays
-        return np.quantile(v, quantile, axis=0), np.quantile(v, 1 - quantile, axis=0)
+        return np.quantile(v, quantile, axis=0), np.quantile(
+            v, 1 - quantile, axis=0
+        )
 
     values = {
         t: df.drop(columns="time").to_numpy()
@@ -643,8 +650,178 @@ def make_windows(values, seq_len, stride=1):
         raise ValueError(
             f"split has {len(values)} rows, fewer than seq_len={seq_len}"
         )
-    starts = np.arange(0, len(values) - seq_len + 1, stride)  # (n_windows,)
+    starts = window_starts(len(values), seq_len, stride)  # (n_windows,)
     return np.stack([values[s : s + seq_len] for s in starts])
+
+
+def window_starts(n_rows, seq_len, stride=1):
+    """
+    Row index at which each window of make_windows begins.
+
+    Args:
+        n_rows (int): rows T in the split.
+        seq_len (int): window length L.
+        stride (int): step between window starts.
+
+    Returns:
+        np.ndarray of shape (n_windows,): 0, stride, 2 * stride, ... up to T - L.
+    """
+    return np.arange(0, n_rows - seq_len + 1, stride)
+
+
+class LOBWindowDataset(Dataset):
+    """
+    Windows of scaled order-book features, each paired with its ticker id.
+
+    __getitem__ returns (window, ticker_id) only, which is all training needs.
+    The per-window metadata below stays on the dataset (same order as the
+    windows) for decoding real windows back to books and for analysis.
+
+    Attributes:
+        windows (torch.FloatTensor): (n_windows, L, F) features scaled to [0, 1].
+        ticker_ids (torch.LongTensor): (n_windows,) index into TICKERS.
+        anchor_mids (np.ndarray): (n_windows,) real mid price in dollars at the
+            grid step just before each window. Decoding needs it, because the
+            features only hold mid log-returns, not the price level.
+        start_times (np.ndarray): (n_windows,) grid time of each window's first
+            step, seconds after midnight.
+    """
+
+    def __init__(self, windows, ticker_ids, anchor_mids, start_times):
+        """
+        Args:
+            windows (np.ndarray): (n_windows, L, F) scaled features.
+            ticker_ids (np.ndarray): (n_windows,) integer ticker ids.
+            anchor_mids (np.ndarray): (n_windows,) anchor mids in dollars.
+            start_times (np.ndarray): (n_windows,) window start times.
+        """
+        self.windows = torch.as_tensor(windows, dtype=torch.float32)
+        self.ticker_ids = torch.as_tensor(ticker_ids, dtype=torch.long)
+        self.anchor_mids = np.asarray(anchor_mids, dtype=np.float64)
+        self.start_times = np.asarray(start_times, dtype=np.float64)
+
+    def __len__(self):
+        """Number of windows."""
+        return len(self.windows)
+
+    def __getitem__(self, i):
+        """
+        Returns:
+            tuple: (window (L, F) float32 tensor, ticker_id () long tensor).
+        """
+        return self.windows[i], self.ticker_ids[i]
+
+
+def build_datasets(
+    data_dir,
+    tickers=TICKERS,
+    representation="unconstrained",
+    step=1.0,
+    scope="global",
+    quantile=0.005,
+    seq_len=24,
+    stride=1,
+):
+    """
+    Run the full pipeline (stages 1-6) and return one dataset per split.
+
+    Per ticker: load -> 1 s grid -> features -> chronological split. Then the
+    scaling is fitted on the training splits only, every split is scaled with
+    clip=True and windowed separately, and all tickers' windows are pooled
+    into one dataset per split.
+
+    Args:
+        data_dir (str): folder holding the LOBSTER CSVs.
+        tickers (sequence[str]): tickers to include; ids follow TICKERS order,
+            so a ticker keeps the same id whichever subset is loaded.
+        representation (str): one of REPRESENTATIONS.
+        step (float): grid step in seconds.
+        scope (str): "global" or "per_ticker" min-max scaling.
+        quantile (float): robust bound percentile for fit_minmax.
+        seq_len (int): window length L.
+        stride (int): window stride.
+
+    Returns:
+        tuple:
+            datasets (dict[str, LOBWindowDataset]): "train" / "val" / "test".
+            stats (dict[str, tuple[np.ndarray, np.ndarray]]): ticker ->
+                (feature_min, feature_max), needed to invert generator output.
+    """
+    splits, mids = {}, {}
+    for ticker in tickers:
+        grid = resample_to_grid(load_ticker(data_dir, ticker), step=step)
+        mids[ticker] = (
+            grid["time"].to_numpy(),
+            ((grid["ask_price_1"] + grid["bid_price_1"]) / 2).to_numpy(),
+        )
+        splits[ticker] = split_by_time(compute_features(grid, representation))
+
+    stats = fit_minmax(
+        {t: s["train"] for t, s in splits.items()},
+        scope=scope,
+        quantile=quantile,
+    )
+
+    datasets = {}
+    for name in SPLIT_BOUNDARIES:
+        windows, ids, anchors, starts = [], [], [], []
+        for ticker in tickers:
+            part = splits[ticker][name]
+            scaled = apply_minmax(
+                part.drop(columns="time").to_numpy(), *stats[ticker], clip=True
+            )
+            start_rows = window_starts(len(part), seq_len, stride)
+            start_times = part["time"].to_numpy()[start_rows]  # (n_windows,)
+
+            # Anchor = mid at the grid step before each window's first step.
+            # searchsorted(t - step/2) finds the row of t itself without exact
+            # float equality on grid times; the anchor is the row before it.
+            grid_time, grid_mid = mids[ticker]
+            start_grid_rows = np.searchsorted(grid_time, start_times - step / 2)
+            anchors.append(grid_mid[start_grid_rows - 1])
+
+            windows.append(make_windows(scaled, seq_len, stride))
+            ids.append(np.full(len(start_rows), TICKERS.index(ticker)))
+            starts.append(start_times)
+        datasets[name] = LOBWindowDataset(
+            np.concatenate(windows),
+            np.concatenate(ids),
+            np.concatenate(anchors),
+            np.concatenate(starts),
+        )
+    return datasets, stats
+
+
+def make_dataloader(
+    dataset, batch_size=128, shuffle=True, balanced=False, seed=0
+):
+    """
+    Wrap a LOBWindowDataset in a DataLoader that mixes tickers in each batch.
+
+    Args:
+        dataset (LOBWindowDataset): windows to serve.
+        batch_size (int): windows per batch (128 in the TimeGAN reference code).
+        shuffle (bool): shuffle windows each epoch (use for training only).
+        balanced (bool): sample tickers equally often, with replacement, via
+            WeightedRandomSampler (weight 1 / windows-of-that-ticker). With all
+            five tickers on the same grid the counts are equal, so this matters
+            only if tickers with different window counts are mixed.
+        seed (int): seeds the shuffling / sampling for reproducibility.
+
+    Returns:
+        torch.utils.data.DataLoader yielding (windows (B, L, F), ticker_ids (B,)).
+    """
+    generator = torch.Generator().manual_seed(seed)
+    if balanced:
+        counts = torch.bincount(dataset.ticker_ids)
+        weights = 1.0 / counts[dataset.ticker_ids].double()
+        sampler = WeightedRandomSampler(
+            weights, len(dataset), replacement=True, generator=generator
+        )
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle, generator=generator
+    )
 
 
 def main():
@@ -679,7 +856,9 @@ def main():
         default="global",
         help="min-max normalisation scope (default: global)",
     )
-    parser.add_argument("--seq-len", type=int, default=24, help="window length")
+    parser.add_argument(
+        "--seq-len", type=int, default=128, help="window length"
+    )
     parser.add_argument("--stride", type=int, default=1, help="window stride")
     args = parser.parse_args()
 
@@ -736,10 +915,32 @@ def main():
             scaled = apply_minmax(raw, *stats[ticker])
             clipped = np.mean((scaled < 0) | (scaled > 1))
             windows = make_windows(
-                apply_minmax(raw, *stats[ticker], clip=True), args.seq_len, args.stride
+                apply_minmax(raw, *stats[ticker], clip=True),
+                args.seq_len,
+                args.stride,
             )
-            parts.append(f"{name} {windows.shape} ({clipped:.1%} values clipped)")
+            parts.append(
+                f"{name} {windows.shape} ({clipped:.1%} values clipped)"
+            )
         print(f"  {ticker}: " + ", ".join(parts))
+
+    datasets, _ = build_datasets(
+        args.data_dir,
+        args.tickers,
+        args.representation,
+        args.step,
+        args.scope,
+        seq_len=args.seq_len,
+        stride=args.stride,
+    )
+    print(
+        "\ndatasets: " + ", ".join(f"{n} {len(d)}" for n, d in datasets.items())
+    )
+    windows, ticker_ids = next(iter(make_dataloader(datasets["train"])))
+    print(
+        f"first train batch: windows {tuple(windows.shape)} {windows.dtype}, "
+        f"ticker counts {torch.bincount(ticker_ids, minlength=len(TICKERS)).tolist()}"
+    )
 
 
 if __name__ == "__main__":
