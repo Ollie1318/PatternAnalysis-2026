@@ -29,7 +29,9 @@ import torch
 from torch import nn
 
 
-def sample_noise(batch_size, seq_len, z_dim, distribution="uniform", device=None):
+def sample_noise(
+    batch_size, seq_len, z_dim, distribution="uniform", device=None
+):
     """
     Draw independent noise for every sequence, step and dimension.
 
@@ -96,8 +98,12 @@ class ConditionalGRU(nn.Module):
             batch_first=True,
             bidirectional=bidirectional,
         )
-        self.head = nn.Linear(hidden_dim * (2 if bidirectional else 1), output_dim)
-        self.activation = activation if activation is not None else nn.Identity()
+        self.head = nn.Linear(
+            hidden_dim * (2 if bidirectional else 1), output_dim
+        )
+        self.activation = (
+            activation if activation is not None else nn.Identity()
+        )
 
     def forward(self, x, ticker_ids):
         """
@@ -109,7 +115,9 @@ class ConditionalGRU(nn.Module):
             torch.Tensor (B, T, output_dim).
         """
         c = self.embedding(ticker_ids)  # (B, C)
-        c = c.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, T, C), same c every step
+        c = c.unsqueeze(1).expand(
+            -1, x.size(1), -1
+        )  # (B, T, C), same c every step
         h, _ = self.gru(torch.cat([x, c], dim=-1))  # (B, T, H or 2H)
         return self.activation(self.head(h))
 
@@ -131,11 +139,24 @@ class RCGANGenerator(nn.Module):
         cond_dim, hidden_dim, num_layers: see ConditionalGRU.
     """
 
-    def __init__(self, z_dim, feature_dim, n_tickers, cond_dim=8, hidden_dim=24, num_layers=3):
+    def __init__(
+        self,
+        z_dim,
+        feature_dim,
+        n_tickers,
+        cond_dim=8,
+        hidden_dim=24,
+        num_layers=3,
+    ):
         super().__init__()
         self.z_dim = z_dim
         self.net = ConditionalGRU(
-            z_dim, feature_dim, n_tickers, cond_dim, hidden_dim, num_layers,
+            z_dim,
+            feature_dim,
+            n_tickers,
+            cond_dim,
+            hidden_dim,
+            num_layers,
             activation=nn.Sigmoid(),
         )
 
@@ -167,10 +188,17 @@ class RCGANDiscriminator(nn.Module):
         cond_dim, hidden_dim, num_layers: see ConditionalGRU.
     """
 
-    def __init__(self, feature_dim, n_tickers, cond_dim=8, hidden_dim=24, num_layers=3):
+    def __init__(
+        self, feature_dim, n_tickers, cond_dim=8, hidden_dim=24, num_layers=3
+    ):
         super().__init__()
         self.net = ConditionalGRU(
-            feature_dim, 1, n_tickers, cond_dim, hidden_dim, num_layers,
+            feature_dim,
+            1,
+            n_tickers,
+            cond_dim,
+            hidden_dim,
+            num_layers,
             bidirectional=True,
         )
 
