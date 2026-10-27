@@ -9,6 +9,8 @@ Current contents:
     RCGANDiscriminator  feature sequence + ticker -> one real/fake logit per step.
     Embedder            TimeGAN: feature sequence + ticker -> latent sequence.
     Recovery            TimeGAN: latent sequence + ticker -> feature sequence.
+    Generator           TimeGAN: noise + ticker -> latent sequence.
+    Supervisor          TimeGAN: latent sequence + ticker -> next-step latents.
     sample_noise        noise sequences for the generators.
 
 Baseline: RCGAN-style recurrent conditional GAN, adapted from
@@ -317,6 +319,111 @@ class Recovery(nn.Module):
 
         Returns:
             torch.Tensor (B, T, F) reconstructed scaled features in (0, 1).
+        """
+        return self.net(h, ticker_ids)
+
+
+class Generator(nn.Module):
+    """
+    TimeGAN generator G: maps noise and the ticker to latent sequences.
+
+    Same structure as RCGANGenerator, but it outputs in the latent space
+    learned by the Embedder rather than in feature space; Recovery turns its
+    output into features. The sigmoid matches the Embedder's (0, 1) latents.
+    During joint training its output is passed through the Supervisor, so G
+    only has to get the overall shape right while S supplies the step-to-step
+    dynamics (TimeGAN paper, Section 4.2).
+
+    Args:
+        z_dim (int): Z, noise size per step.
+        n_tickers (int): number of ticker ids.
+        latent_dim (int | None): K; must match the Embedder's latent_dim.
+        cond_dim, hidden_dim, num_layers: see ConditionalGRU.
+    """
+
+    def __init__(
+        self,
+        z_dim,
+        n_tickers,
+        latent_dim=None,
+        cond_dim=8,
+        hidden_dim=24,
+        num_layers=3,
+    ):
+        super().__init__()
+        self.z_dim = z_dim
+        self.latent_dim = latent_dim or hidden_dim
+        self.net = ConditionalGRU(
+            z_dim,
+            self.latent_dim,
+            n_tickers,
+            cond_dim,
+            hidden_dim,
+            num_layers,
+            activation=nn.Sigmoid(),
+        )
+
+    def forward(self, z, ticker_ids):
+        """
+        Args:
+            z (torch.Tensor): (B, T, Z) noise.
+            ticker_ids (torch.LongTensor): (B,) ticker ids to generate.
+
+        Returns:
+            torch.Tensor (B, T, K) synthetic latent sequence in (0, 1).
+        """
+        return self.net(z, ticker_ids)
+
+
+class Supervisor(nn.Module):
+    """
+    TimeGAN supervisor S: predicts the next latent step from the latents so far.
+
+    Output step t is the prediction of latent step t + 1, given steps 1..t (the
+    GRU runs forwards only, so it cannot look ahead). The supervised loss is
+    therefore ||h[:, 1:] - S(h)[:, :-1]||^2 on real embeddings (phase 2), and
+    the same loss on generated latents pushes G towards real one-step
+    transitions (phase 3). This is the paper's answer to an adversarial loss
+    alone not capturing step-wise conditional distributions.
+
+    The reference code gives the supervisor one GRU layer fewer than the other
+    networks (num_layer - 1), hence the default of 2 layers here.
+
+    Args:
+        n_tickers (int): number of ticker ids.
+        latent_dim (int | None): K; must match the Embedder's latent_dim.
+        cond_dim, hidden_dim: see ConditionalGRU.
+        num_layers (int): GRU layers (default 2 = 3 - 1, as in the reference code).
+    """
+
+    def __init__(
+        self,
+        n_tickers,
+        latent_dim=None,
+        cond_dim=8,
+        hidden_dim=24,
+        num_layers=2,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim or hidden_dim
+        self.net = ConditionalGRU(
+            self.latent_dim,
+            self.latent_dim,
+            n_tickers,
+            cond_dim,
+            hidden_dim,
+            num_layers,
+            activation=nn.Sigmoid(),
+        )
+
+    def forward(self, h, ticker_ids):
+        """
+        Args:
+            h (torch.Tensor): (B, T, K) real or generated latent sequence.
+            ticker_ids (torch.LongTensor): (B,) ticker ids.
+
+        Returns:
+            torch.Tensor (B, T, K); step t is the prediction of h[:, t + 1].
         """
         return self.net(h, ticker_ids)
 
