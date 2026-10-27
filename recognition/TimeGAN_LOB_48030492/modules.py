@@ -1,17 +1,22 @@
 """
 Model components for conditional order-book generation (pure PyTorch, no NumPy).
 
-Current contents:
-    ConditionalGRU      GRU stack whose input at every step is the step's
-                        features concatenated with a ticker embedding; shared
-                        building block for the baseline and (later) TimeGAN.
-    RCGANGenerator      noise + ticker -> feature sequence in [0, 1].
-    RCGANDiscriminator  feature sequence + ticker -> one real/fake logit per step.
-    Embedder            TimeGAN: feature sequence + ticker -> latent sequence.
-    Recovery            TimeGAN: latent sequence + ticker -> feature sequence.
-    Generator           TimeGAN: noise + ticker -> latent sequence.
-    Supervisor          TimeGAN: latent sequence + ticker -> next-step latents.
-    sample_noise        noise sequences for the generators.
+Contents, in file order:
+    Shared building blocks
+        sample_noise        noise sequences for the generators.
+        ConditionalGRU      GRU stack whose input at every step is the step's
+                            features concatenated with a ticker embedding.
+    RCGAN-style baseline (feature space)
+        RCGANGenerator      noise + ticker -> feature sequence in [0, 1].
+        RCGANDiscriminator  feature sequence + ticker -> real/fake logit per step.
+    TimeGAN (latent space)
+        Embedder            feature sequence + ticker -> latent sequence.
+        Recovery            latent sequence + ticker -> feature sequence.
+        Generator           noise + ticker -> latent sequence.
+        Supervisor          latent sequence + ticker -> next-step latents.
+        Discriminator       latent sequence + ticker -> real/fake logit per step.
+    Utilities
+        count_parameters    trainable parameter count.
 
 Baseline: RCGAN-style recurrent conditional GAN, adapted from
     Esteban, Hyland & Raetsch (2017), "Real-valued (Medical) Time Series
@@ -37,6 +42,11 @@ Z = noise size, C = ticker-embedding size, H = hidden size, K = latent size.
 
 import torch
 from torch import nn
+
+
+# =============================================================================
+# Shared building blocks (used by both RCGAN and TimeGAN)
+# =============================================================================
 
 
 def sample_noise(
@@ -132,6 +142,11 @@ class ConditionalGRU(nn.Module):
         return self.activation(self.head(h))
 
 
+# =============================================================================
+# RCGAN-style baseline (Esteban et al. 2017): works directly in feature space
+# =============================================================================
+
+
 class RCGANGenerator(nn.Module):
     """
     RCGAN generator: maps noise z_t and the ticker to features, step by step.
@@ -222,6 +237,11 @@ class RCGANDiscriminator(nn.Module):
             torch.Tensor (B, T) logits; > 0 means "looks real".
         """
         return self.net(x, ticker_ids).squeeze(-1)
+
+
+# =============================================================================
+# TimeGAN (Yoon et al. 2019): adversarial game in a learned latent space
+# =============================================================================
 
 
 class Embedder(nn.Module):
@@ -426,6 +446,62 @@ class Supervisor(nn.Module):
             torch.Tensor (B, T, K); step t is the prediction of h[:, t + 1].
         """
         return self.net(h, ticker_ids)
+
+
+class Discriminator(nn.Module):
+    """
+    TimeGAN discriminator D: one real/fake logit per step of a latent sequence.
+
+    Identical in design to RCGANDiscriminator (conditional, bidirectional GRU,
+    linear head, raw logits for BCEWithLogitsLoss), so the two models differ
+    only in the components under test. The difference is the input: TimeGAN's
+    adversarial game is played in the latent space (TimeGAN paper, Section
+    4.2), so D receives K-dimensional latents (real embeddings E(x), or
+    generator output with or without the Supervisor) instead of F features.
+    Kept as a separate class so the two models' weights and defaults never mix.
+
+    Args:
+        n_tickers (int): number of ticker ids.
+        latent_dim (int | None): K, input size; None uses hidden_dim, matching
+            the Embedder's default.
+        cond_dim, hidden_dim, num_layers: see ConditionalGRU.
+    """
+
+    def __init__(
+        self,
+        n_tickers,
+        latent_dim=None,
+        cond_dim=8,
+        hidden_dim=24,
+        num_layers=3,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim or hidden_dim
+        self.net = ConditionalGRU(
+            self.latent_dim,
+            1,
+            n_tickers,
+            cond_dim,
+            hidden_dim,
+            num_layers,
+            bidirectional=True,
+        )
+
+    def forward(self, h, ticker_ids):
+        """
+        Args:
+            h (torch.Tensor): (B, T, K) real or synthetic latent sequence.
+            ticker_ids (torch.LongTensor): (B,) ticker ids.
+
+        Returns:
+            torch.Tensor (B, T) logits; > 0 means "looks real".
+        """
+        return self.net(h, ticker_ids).squeeze(-1)
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
 
 
 def count_parameters(module):
