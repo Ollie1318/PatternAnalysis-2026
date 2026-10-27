@@ -7,6 +7,8 @@ Current contents:
                         building block for the baseline and (later) TimeGAN.
     RCGANGenerator      noise + ticker -> feature sequence in [0, 1].
     RCGANDiscriminator  feature sequence + ticker -> one real/fake logit per step.
+    Embedder            TimeGAN: feature sequence + ticker -> latent sequence.
+    Recovery            TimeGAN: latent sequence + ticker -> feature sequence.
     sample_noise        noise sequences for the generators.
 
 Baseline: RCGAN-style recurrent conditional GAN, adapted from
@@ -21,8 +23,14 @@ did for their benchmarks, and a bidirectional discriminator (TimeGAN paper,
 Section 4.2). It is therefore an RCGAN-*style* adaptation, not an exact
 reproduction of the original (LSTM) implementation.
 
+TimeGAN networks follow Yoon, Jarrett & van der Schaar (2019), "Time-series
+Generative Adversarial Networks", NeurIPS, and the authors' reference code
+(github.com/jsyoon0823/TimeGAN, timegan.py). The reference code is
+unconditional; the ticker conditioning on every network is this project's
+extension.
+
 Shapes: B = batch, T = sequence length, F = features per step,
-Z = noise size, C = ticker-embedding size, H = hidden size.
+Z = noise size, C = ticker-embedding size, H = hidden size, K = latent size.
 """
 
 import torch
@@ -212,6 +220,105 @@ class RCGANDiscriminator(nn.Module):
             torch.Tensor (B, T) logits; > 0 means "looks real".
         """
         return self.net(x, ticker_ids).squeeze(-1)
+
+
+class Embedder(nn.Module):
+    """
+    TimeGAN embedding network E: maps real feature sequences to latent sequences.
+
+    The adversarial game and the supervisor both work in this latent space
+    rather than on raw features (TimeGAN paper, Section 4.1). As in the
+    reference code, the latent output passes through a sigmoid, so latents lie
+    in (0, 1) like the generator's output and the two can be compared directly.
+    The GRU runs forwards only, so latent step t depends on features up to t.
+
+    Args:
+        feature_dim (int): F, input features (41 unconstrained, 40 constrained).
+        n_tickers (int): number of ticker ids.
+        latent_dim (int | None): K; None uses hidden_dim, as the reference
+            code does.
+        cond_dim, hidden_dim, num_layers: see ConditionalGRU.
+    """
+
+    def __init__(
+        self,
+        feature_dim,
+        n_tickers,
+        latent_dim=None,
+        cond_dim=8,
+        hidden_dim=24,
+        num_layers=3,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim or hidden_dim
+        self.net = ConditionalGRU(
+            feature_dim,
+            self.latent_dim,
+            n_tickers,
+            cond_dim,
+            hidden_dim,
+            num_layers,
+            activation=nn.Sigmoid(),
+        )
+
+    def forward(self, x, ticker_ids):
+        """
+        Args:
+            x (torch.Tensor): (B, T, F) scaled features.
+            ticker_ids (torch.LongTensor): (B,) ticker ids.
+
+        Returns:
+            torch.Tensor (B, T, K) latent sequence in (0, 1).
+        """
+        return self.net(x, ticker_ids)
+
+
+class Recovery(nn.Module):
+    """
+    TimeGAN recovery network R: maps latent sequences back to feature sequences.
+
+    Trained with E as an autoencoder (phase 1, reconstruction loss
+    ||x - R(E(x))||^2), then decodes the generator's latents into features at
+    generation time. The sigmoid matches the [0, 1] min-max scaled features.
+
+    Args:
+        feature_dim (int): F, output features.
+        n_tickers (int): number of ticker ids.
+        latent_dim (int | None): K; must match the Embedder's latent_dim.
+        cond_dim, hidden_dim, num_layers: see ConditionalGRU.
+    """
+
+    def __init__(
+        self,
+        feature_dim,
+        n_tickers,
+        latent_dim=None,
+        cond_dim=8,
+        hidden_dim=24,
+        num_layers=3,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim or hidden_dim
+        self.net = ConditionalGRU(
+            self.latent_dim,
+            feature_dim,
+            n_tickers,
+            cond_dim,
+            hidden_dim,
+            num_layers,
+            activation=nn.Sigmoid(),
+        )
+
+    def forward(self, h, ticker_ids):
+        """
+        Args:
+            h (torch.Tensor): (B, T, K) latent sequence.
+            ticker_ids (torch.LongTensor): (B,) ticker ids.
+
+        Returns:
+            torch.Tensor (B, T, F) reconstructed scaled features in (0, 1).
+        """
+        return self.net(h, ticker_ids)
 
 
 def count_parameters(module):
