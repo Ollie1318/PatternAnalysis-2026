@@ -103,9 +103,7 @@ def parse_args():
     p.add_argument("--device", default="auto", help="'auto', 'cuda', 'cuda:1' or 'cpu'")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs")
-    p.add_argument(
-        "--run-name", default=None, help="default: <model>_<representation>_seed<seed>"
-    )
+    p.add_argument("--run-name", default=None, help="default: <model>_<representation>_seed<seed>")
     p.add_argument("--log-every", type=int, default=50)
     return p.parse_args()
 
@@ -270,16 +268,15 @@ def train_embedding(args, datasets, device):
 
     Loss, as in the reference code (timegan.py, E_loss0):
         L_R = 10 * sqrt(MSE(x, R(E(x, c), c)))
-    The square root keeps gradients large once the MSE is small, and the
-    factor 10 only rescales the step size. Only E and R are trained here; the
-    latent space they learn is where the supervisor and the adversarial game
-    work in phases 2 and 3 (TimeGAN paper, Section 4.1).
+
 
     Reconstruction MSE is also tracked on a fixed, evenly spread subset of the
     validation windows (every ticker is represented, since the validation set
     is stored ticker by ticker), and compared with the MSE of predicting each
     feature's validation mean. Reconstruction close to that baseline means the
-    latent space is losing most of the information in the books.
+    latent space is losing most of the information in the books. At the end,
+    the same comparison is made per ticker, against each ticker's own mean, so a stock the latent space serves badly is not hidden
+    by the pooled average.
 
     Args:
         args (argparse.Namespace): see parse_args.
@@ -354,6 +351,23 @@ def train_embedding(args, datasets, device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     seconds = time.perf_counter() - start
+
+    # Per-ticker reconstruction MSE vs predicting that ticker's own mean.
+    by_ticker = {}
+    with torch.no_grad():
+        val_err = (R(E(val_x, val_ids), val_ids) - val_x) ** 2  # (N, L, F)
+    for tid in val_ids.unique().tolist():
+        rows = val_ids == tid
+        x_t = val_x[rows]
+        by_ticker[TICKERS[tid]] = {
+            "recon_mse": val_err[rows].mean().item(),
+            "predict_mean_mse": ((x_t - x_t.mean(dim=(0, 1))) ** 2).mean().item(),
+        }
+        print(
+            f"  {TICKERS[tid]}: val recon MSE {by_ticker[TICKERS[tid]]['recon_mse']:.5f}  "
+            f"(own-mean baseline {by_ticker[TICKERS[tid]]['predict_mean_mse']:.5f})"
+        )
+
     resources = {
         "phase1_seconds": seconds,
         "phase1_seconds_per_iteration": seconds / iterations,
@@ -364,6 +378,7 @@ def train_embedding(args, datasets, device):
         "params_recovery": count_parameters(R),
         "val_predict_mean_mse": val_baseline,
         "final_val_recon_mse": val_mse(),
+        "final_val_by_ticker": by_ticker,
     }
     return E, R, history, resources
 
@@ -412,8 +427,15 @@ def plot_losses(history, run_dir, series, title, ylabel, smooth=25, baseline=Non
             )
     if baseline is not None:
         ax.axhline(baseline[0], color="#52514e", linewidth=0.8, linestyle=(0, (3, 3)))
-        ax.text(0.01, baseline[0], baseline[1], transform=ax.get_yaxis_transform(),
-                color="#52514e", fontsize=8, va="bottom")
+        ax.text(
+            0.01,
+            baseline[0],
+            baseline[1],
+            transform=ax.get_yaxis_transform(),
+            color="#52514e",
+            fontsize=8,
+            va="bottom",
+        )
     ax.set_xlabel("Iteration", color="#52514e")
     ax.set_ylabel(ylabel, color="#52514e")
     ax.set_title(title, loc="left", fontweight="bold")
