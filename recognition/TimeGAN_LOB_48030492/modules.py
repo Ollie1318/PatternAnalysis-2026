@@ -87,11 +87,16 @@ class ConditionalGRU(nn.Module):
     network as an extra input). A linear layer maps each hidden state to the
     output size, followed by an optional activation.
 
+    cond_dim=0 switches conditioning off: no embedding is created and the GRU
+    sees x_t alone, so the ticker id is ignored (unconditional ablation and
+    the single-ticker fallback). A zero-width nn.Embedding is avoided on
+    purpose: it works on CPU but crashes CUDA with an illegal memory access.
+
     Args:
         input_dim (int): size of x_t.
         output_dim (int): size of each output step.
         n_tickers (int): number of distinct ticker ids.
-        cond_dim (int): C, ticker-embedding size.
+        cond_dim (int): C, ticker-embedding size; 0 disables conditioning.
         hidden_dim (int): H, GRU hidden size.
         num_layers (int): stacked GRU layers (3 in the TimeGAN paper).
         bidirectional (bool): run the GRU in both directions (discriminators).
@@ -110,7 +115,8 @@ class ConditionalGRU(nn.Module):
         activation=None,
     ):
         super().__init__()
-        self.embedding = nn.Embedding(n_tickers, cond_dim)
+        # None when unconditional (cond_dim=0); see the class docstring.
+        self.embedding = nn.Embedding(n_tickers, cond_dim) if cond_dim > 0 else None
         self.gru = nn.GRU(
             input_size=input_dim + cond_dim,
             hidden_size=hidden_dim,
@@ -129,16 +135,19 @@ class ConditionalGRU(nn.Module):
         """
         Args:
             x (torch.Tensor): (B, T, input_dim) input sequence.
-            ticker_ids (torch.LongTensor): (B,) ticker ids.
+            ticker_ids (torch.LongTensor): (B,) ticker ids (ignored when
+                unconditional).
 
         Returns:
             torch.Tensor (B, T, output_dim).
         """
-        c = self.embedding(ticker_ids)  # (B, C)
-        c = c.unsqueeze(1).expand(
-            -1, x.size(1), -1
-        )  # (B, T, C), same c every step
-        h, _ = self.gru(torch.cat([x, c], dim=-1))  # (B, T, H or 2H)
+        if self.embedding is not None:
+            c = self.embedding(ticker_ids)  # (B, C)
+            c = c.unsqueeze(1).expand(
+                -1, x.size(1), -1
+            )  # (B, T, C), same c every step
+            x = torch.cat([x, c], dim=-1)  # (B, T, input_dim + C)
+        h, _ = self.gru(x)  # (B, T, H or 2H)
         return self.activation(self.head(h))
 
 

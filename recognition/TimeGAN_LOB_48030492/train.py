@@ -67,7 +67,7 @@ def parse_args():
     # Model
     p.add_argument("--hidden-dim", type=int, default=24)
     p.add_argument("--num-layers", type=int, default=3)
-    p.add_argument("--cond-dim", type=int, default=8, help="ticker embedding size")
+    p.add_argument("--cond-dim", type=int, default=8, help="ticker embedding size (0 = unconditional)")
     p.add_argument(
         "--latent-dim", type=int, default=None, help="TimeGAN latent size (default: hidden size)"
     )
@@ -275,8 +275,8 @@ def train_embedding(args, datasets, device):
     is stored ticker by ticker), and compared with the MSE of predicting each
     feature's validation mean. Reconstruction close to that baseline means the
     latent space is losing most of the information in the books. At the end,
-    the same comparison is made per ticker, against each ticker's own mean, so a stock the latent space serves badly is not hidden
-    by the pooled average.
+    the same comparison is made per ticker, against each ticker's own mean, so
+    a stock the latent space serves badly is not hidden by the pooled average.
 
     Args:
         args (argparse.Namespace): see parse_args.
