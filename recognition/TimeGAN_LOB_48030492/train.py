@@ -28,6 +28,8 @@ Usage:
     python train.py --data-dir data --iterations 50 --device cpu   # quick smoke test
     python train.py --data-dir data --model timegan --ae-iterations 10000 \
         --sup-iterations 10000 --iterations 10000
+    # phase 3 only, reusing phases 1 and 2 from an earlier run with the same settings
+    python train.py --data-dir data --model timegan --init-from runs/<earlier-run> --iterations 10000
 """
 
 import argparse
@@ -100,6 +102,12 @@ def parse_args():
         type=int,
         default=None,
         help="TimeGAN phase 2 (supervisor) iterations (default: --iterations, as in the reference code)",
+    )
+    p.add_argument(
+        "--init-from",
+        default=None,
+        help="TimeGAN only: run folder whose checkpoint provides trained embedder, recovery "
+        "and supervisor; phases 1 and 2 are skipped and training starts at phase 3",
     )
     p.add_argument(
         "--val-windows",
@@ -556,6 +564,71 @@ def train_supervisor(args, datasets, device, E):
     return S, history, resources
 
 
+def load_phases_1_2(run_dir, args, stats, feature_dim, device):
+    """
+    Load a trained embedder, recovery and supervisor from an earlier run, so
+    phase 3 can start without repeating phases 1 and 2 (--init-from).
+
+    The earlier run must match this one in everything the loaded weights
+    depend on: the network sizes (otherwise the weights do not fit) and the
+    data preparation (otherwise the networks would see differently scaled
+    features without any error being raised). The min-max statistics are
+    compared directly as a final check.
+
+    Args:
+        run_dir (str): folder containing checkpoint.pt from a TimeGAN run that
+            completed at least phase 2.
+        args (argparse.Namespace): this run's arguments.
+        stats (dict): this run's min-max statistics from build_datasets.
+        feature_dim (int): F.
+        device (torch.device): where to put the networks.
+
+    Returns:
+        tuple: (E, R, S, the earlier run's config dict).
+
+    Raises:
+        ValueError: if the checkpoint lacks phase 1/2 weights or does not match
+            this run's settings or scaling.
+    """
+    ckpt = torch.load(os.path.join(run_dir, "checkpoint.pt"), map_location=device, weights_only=True)
+    missing = [k for k in ("embedder", "recovery", "supervisor") if k not in ckpt]
+    if missing:
+        raise ValueError(f"{run_dir} has no {missing} weights; it must have completed phase 2")
+
+    src = ckpt["config"]
+    keys = (
+        "hidden_dim", "num_layers", "cond_dim",  # network sizes
+        "tickers", "representation", "step", "scope", "quantile",  # data preparation
+    )
+    mismatched = {k: (src.get(k), getattr(args, k)) for k in keys if src.get(k) != getattr(args, k)}
+    # Latent size: None means "same as hidden", so compare the effective sizes.
+    src_latent = src.get("latent_dim") or src.get("hidden_dim")
+    latent = args.latent_dim or args.hidden_dim
+    if src_latent != latent:
+        mismatched["latent_dim (effective)"] = (src_latent, latent)
+    if mismatched:
+        raise ValueError(f"--init-from run differs (earlier, now): {mismatched}")
+    for ticker, (lo, hi) in stats.items():
+        src_lo, src_hi = (np.asarray(v) for v in ckpt["minmax"][ticker])
+        if not (np.allclose(src_lo, lo) and np.allclose(src_hi, hi)):
+            raise ValueError(f"min-max statistics for {ticker} differ from the --init-from run")
+
+    n_tickers = len(TICKERS)
+    E = Embedder(
+        feature_dim, n_tickers, args.latent_dim, args.cond_dim, args.hidden_dim, args.num_layers
+    ).to(device)
+    R = Recovery(
+        feature_dim, n_tickers, args.latent_dim, args.cond_dim, args.hidden_dim, args.num_layers
+    ).to(device)
+    S = Supervisor(
+        n_tickers, E.latent_dim, args.cond_dim, args.hidden_dim, max(1, args.num_layers - 1)
+    ).to(device)
+    E.load_state_dict(ckpt["embedder"])
+    R.load_state_dict(ckpt["recovery"])
+    S.load_state_dict(ckpt["supervisor"])
+    return E, R, S, src
+
+
 def moment_loss(x_hat, x):
     """
     TimeGAN moment-matching loss (reference code, G_loss_V = V1 + V2).
@@ -845,6 +918,8 @@ def plot_losses(
 def main():
     """Build the data, train the chosen model, and save config, losses, plot and checkpoint."""
     args = parse_args()
+    if args.init_from and args.model != "timegan":
+        raise SystemExit("--init-from only applies to --model timegan")
     set_seed(args.seed)
     device = resolve_device(args.device)
     run_name = args.run_name or f"{args.model}_{args.representation}_seed{args.seed}"
@@ -878,6 +953,13 @@ def main():
             "RCGAN adversarial losses",
             "BCE loss",
         )
+    elif args.init_from:
+        # Phases 1 and 2 loaded from an earlier run; their resources are kept
+        # under "init_resources" so total training cost can still be reported.
+        feature_dim = datasets["train"].windows.shape[-1]
+        E, R, S, src = load_phases_1_2(args.init_from, args, stats, feature_dim, device)
+        print(f"phases 1 and 2 loaded from {args.init_from}")
+        resources = {"init_from": args.init_from, "init_resources": src["resources"]}
     else:
         # Phase 1: embedder + recovery autoencoder.
         E, R, history1, resources = train_embedding(args, datasets, device)
@@ -904,6 +986,8 @@ def main():
             baseline=(resources["val_persistence_mse"], "val persistence (next = current)"),
             filename="loss_curves_phase2.png",
         )
+
+    if args.model == "timegan":
         # Phase 3: joint training; E, R and S are updated in place.
         G, D, history3, resources3 = train_joint(args, datasets, device, E, R, S)
         resources.update(resources3)
