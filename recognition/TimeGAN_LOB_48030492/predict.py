@@ -344,11 +344,16 @@ def plot_vwap_paths(paths, path):
             ax.plot(steps, utils.mid_price(book[0], book[1]), color=colour, linewidth=0.8,
                     linestyle=(0, (2, 2)), alpha=alpha, label=None if label is None else f"{label} mid")
         ax.set_ylabel("Price ($)", color=MUTED, fontsize=8)
-    axes[0, 0].legend(frameon=False, fontsize=8, labelcolor=TEXT, ncol=4, loc="upper left")
     axes[-1, 0].set_xlabel("Step (s)", color=MUTED, fontsize=8)
+    # Title, then one shared legend in its own strip, then the panels, spaced in
+    # inches so the legend never overlaps the title or the data.
+    height = fig.get_figheight()
     fig.suptitle("Book VWAP (solid) and mid (dashed): real vs generated from the same starting mid",
-                 x=0.01, ha="left", color=TEXT)
-    fig.tight_layout()
+                 x=0.01, y=1 - 0.08 / height, ha="left", va="top", color=TEXT)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, fontsize=8, labelcolor=TEXT, ncol=4,
+               loc="upper left", bbox_to_anchor=(0.01, 1 - 0.4 / height))
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.62 / height))
     fig.savefig(path, dpi=110, facecolor=SURFACE)
     plt.close(fig)
 
