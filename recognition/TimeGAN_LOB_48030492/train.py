@@ -6,24 +6,27 @@ Models (--model):
              RCGANDiscriminator), trained on adversarial (BCE) loss only,
              following Esteban, Hyland & Raetsch (2017).
     timegan  TimeGAN (Yoon, Jarrett & van der Schaar 2019), trained in three
-             phases. Current stage: phase 1 only (embedder + recovery
-             autoencoder); phases 2 and 3 will be added next and will share
-             the RCGAN loop's stabilisation tricks, logging and checkpointing,
-             so the comparison is fair.
+             phases. Current stage: phase 1 (embedder + recovery autoencoder)
+             then phase 2 (supervisor on real embeddings); phase 3 (joint
+             adversarial training) will be added next and will share the
+             RCGAN loop's stabilisation tricks, logging and checkpointing, so
+             the comparison is fair.
 
 Runs on GPU when available and falls back to CPU (--device auto), so the same
 command works locally for smoke tests and on Rangpur for full runs.
 
 Each run writes to --out-dir/<run-name>/ (gitignored under runs/):
     config.json        every argument, plus device, parameter counts and resources
-    losses.csv         every loss at every iteration
-    loss_curves.png    loss plot
+    losses.csv         every loss at every iteration (RCGAN)
+    loss_curves.png    loss plot (RCGAN)
+    losses_phase<k>.csv, loss_curves_phase<k>.png
+                       the same, one per TimeGAN phase
     checkpoint.pt      model weights, config and scaling statistics
 
 Usage:
     python train.py --data-dir data --iterations 2000
     python train.py --data-dir data --iterations 50 --device cpu   # quick smoke test
-    python train.py --data-dir data --model timegan --ae-iterations 10000
+    python train.py --data-dir data --model timegan --ae-iterations 10000 --sup-iterations 10000
 """
 
 import argparse
@@ -44,6 +47,7 @@ from modules import (
     RCGANDiscriminator,
     RCGANGenerator,
     Recovery,
+    Supervisor,
     count_parameters,
     sample_noise,
 )
@@ -84,10 +88,16 @@ def parse_args():
         help="TimeGAN phase 1 (autoencoder) iterations (default: --iterations, as in the reference code)",
     )
     p.add_argument(
+        "--sup-iterations",
+        type=int,
+        default=None,
+        help="TimeGAN phase 2 (supervisor) iterations (default: --iterations, as in the reference code)",
+    )
+    p.add_argument(
         "--val-windows",
         type=int,
         default=2048,
-        help="validation windows used to track reconstruction loss",
+        help="validation windows used to track the phase 1 and 2 losses",
     )
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -141,6 +151,30 @@ def infinite_batches(loader):
     """Yield batches forever, starting a new (reshuffled) epoch when one ends."""
     while True:
         yield from loader
+
+
+def val_subset(val_set, n_windows, device):
+    """
+    Fixed, evenly spread subset of the validation windows for loss tracking.
+
+    The validation set is stored ticker by ticker, so taking the first windows
+    would cover only the first ticker; evenly spaced indices cover them all.
+
+    Args:
+        val_set (LOBWindowDataset): validation windows.
+        n_windows (int): how many to keep (capped at the set size).
+        device (torch.device): where to put them.
+
+    Returns:
+        tuple: (windows (N, L, F), ticker_ids (N,)) on device.
+    """
+    pick = torch.linspace(0, len(val_set) - 1, min(n_windows, len(val_set))).long()
+    return val_set.windows[pick].to(device), val_set.ticker_ids[pick].to(device)
+
+
+def peak_vram_mb(device):
+    """Peak allocated GPU memory since the last reset, in MB (None on CPU)."""
+    return torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None
 
 
 def train_rcgan(args, datasets, device):
@@ -252,9 +286,7 @@ def train_rcgan(args, datasets, device):
     resources = {
         "train_seconds": seconds,
         "seconds_per_iteration": seconds / args.iterations,
-        "peak_vram_mb": (
-            torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None
-        ),
+        "peak_vram_mb": peak_vram_mb(device),
         "params_generator": count_parameters(G),
         "params_discriminator": count_parameters(D),
         "d_update_rate": float(np.mean([h["d_updated"] for h in history])),
@@ -307,9 +339,7 @@ def train_embedding(args, datasets, device):
     batches = infinite_batches(loader)
 
     # Fixed validation subset and its predict-the-mean baseline.
-    pick = torch.linspace(0, len(val_set) - 1, min(args.val_windows, len(val_set))).long()
-    val_x = val_set.windows[pick].to(device)
-    val_ids = val_set.ticker_ids[pick].to(device)
+    val_x, val_ids = val_subset(val_set, args.val_windows, device)
     val_baseline = ((val_x - val_x.mean(dim=(0, 1))) ** 2).mean().item()
 
     def val_mse():  # no dropout or batch norm, so no train/eval switch is needed
@@ -371,9 +401,7 @@ def train_embedding(args, datasets, device):
     resources = {
         "phase1_seconds": seconds,
         "phase1_seconds_per_iteration": seconds / iterations,
-        "peak_vram_mb": (
-            torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None
-        ),
+        "phase1_peak_vram_mb": peak_vram_mb(device),
         "params_embedder": count_parameters(E),
         "params_recovery": count_parameters(R),
         "val_predict_mean_mse": val_baseline,
@@ -383,15 +411,137 @@ def train_embedding(args, datasets, device):
     return E, R, history, resources
 
 
-def save_losses(history, run_dir):
-    """Write every logged value per iteration to losses.csv."""
-    with open(os.path.join(run_dir, "losses.csv"), "w", newline="") as f:
+def train_supervisor(args, datasets, device, E):
+    """
+    TimeGAN phase 2: train the supervisor S on real embeddings.
+
+    Loss, as in the reference code (timegan.py, G_loss_S):
+        L_S = MSE(h[:, 1:], S(h, c)[:, :-1]),   h = E(x, c)
+    i.e. S's output at step t is scored against the real latent at t + 1, so
+    S learns the step-to-step transitions of real books (TimeGAN paper,
+    Section 4.2). The embedder from phase 1 is frozen here.
+
+    The reference code hands both G's and S's parameters to this phase's
+    optimiser, but the loss only involves real embeddings, so G receives no
+    gradient and is unchanged; only S is trained here. G is first trained in
+    phase 3, where this loss is applied to its own latents.
+
+    Validation loss is compared with a persistence baseline, predicting
+    h[:, t + 1] = h[:, t]. Books change little from one second to the next, so
+    this "nothing moves" guess is already strong; S has only learned real
+    dynamics if it goes clearly below it. At the end both are reported per
+    ticker.
+
+    Args:
+        args (argparse.Namespace): see parse_args.
+        datasets (dict): "train" / "val" / "test" LOBWindowDataset.
+        device (torch.device): where to train.
+        E (modules.Embedder): trained embedder from phase 1 (not updated).
+
+    Returns:
+        tuple: (supervisor, list of per-iteration loss dicts, resources dict).
+    """
+    n_tickers = len(TICKERS)  # ids follow TICKERS order whatever subset is loaded
+    iterations = args.sup_iterations or args.iterations
+
+    # One GRU layer fewer than the other networks, as in the reference code.
+    S = Supervisor(
+        n_tickers, E.latent_dim, args.cond_dim, args.hidden_dim, max(1, args.num_layers - 1)
+    ).to(device)
+    opt = torch.optim.Adam(S.parameters(), lr=args.lr)
+    mse = nn.MSELoss()  # mean over batch, time steps and latent dimensions
+    E.requires_grad_(False)  # frozen: phase 2 only trains S (phase 3 must re-enable it)
+
+    loader = make_dataloader(
+        datasets["train"], args.batch_size, shuffle=True, balanced=args.balanced, seed=args.seed
+    )
+    batches = infinite_batches(loader)
+
+    # Fixed validation subset, embedded once (E no longer changes).
+    val_x, val_ids = val_subset(datasets["val"], args.val_windows, device)
+    with torch.no_grad():
+        val_h = E(val_x, val_ids)  # (N, L, K)
+    persistence = mse(val_h[:, :-1], val_h[:, 1:]).item()
+
+    def val_mse():
+        with torch.no_grad():
+            return mse(S(val_h, val_ids)[:, :-1], val_h[:, 1:]).item()
+
+    print(f"phase 2: {iterations} iterations; val persistence baseline MSE {persistence:.6f}")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    history = []
+    start = time.perf_counter()
+
+    for it in range(1, iterations + 1):
+        x, ids = next(batches)
+        x, ids = x.to(device, non_blocking=True), ids.to(device, non_blocking=True)
+        with torch.no_grad():
+            h = E(x, ids)  # (B, L, K) real latents
+        loss = mse(S(h, ids)[:, :-1], h[:, 1:])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        logging = it % args.log_every == 0 or it == 1
+        history.append(
+            {
+                "iteration": it,
+                "sup_mse": loss.item(),
+                # Validation MSE only on logging iterations (blank in the CSV otherwise).
+                "val_sup_mse": val_mse() if logging else None,
+            }
+        )
+        if logging:
+            row = history[-1]  # not "h", which is the latent batch here
+            print(
+                f"[{it:>6}/{iterations}] sup_mse {row['sup_mse']:.6f}  "
+                f"val {row['val_sup_mse']:.6f}  {time.perf_counter() - start:.1f} s"
+            )
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    seconds = time.perf_counter() - start
+
+    # Per-ticker supervised MSE vs that ticker's persistence baseline.
+    by_ticker = {}
+    with torch.no_grad():
+        sup_err = (S(val_h, val_ids)[:, :-1] - val_h[:, 1:]) ** 2  # (N, L-1, K)
+    pers_err = (val_h[:, :-1] - val_h[:, 1:]) ** 2
+    for tid in val_ids.unique().tolist():
+        rows = val_ids == tid
+        by_ticker[TICKERS[tid]] = {
+            "sup_mse": sup_err[rows].mean().item(),
+            "persistence_mse": pers_err[rows].mean().item(),
+        }
+        print(
+            f"  {TICKERS[tid]}: val sup MSE {by_ticker[TICKERS[tid]]['sup_mse']:.6f}  "
+            f"(persistence {by_ticker[TICKERS[tid]]['persistence_mse']:.6f})"
+        )
+
+    resources = {
+        "phase2_seconds": seconds,
+        "phase2_seconds_per_iteration": seconds / iterations,
+        "phase2_peak_vram_mb": peak_vram_mb(device),
+        "params_supervisor": count_parameters(S),
+        "val_persistence_mse": persistence,
+        "final_val_sup_mse": val_mse(),
+        "final_val_sup_by_ticker": by_ticker,
+    }
+    return S, history, resources
+
+
+def save_losses(history, run_dir, filename="losses.csv"):
+    """Write every logged value per iteration to run_dir/filename."""
+    with open(os.path.join(run_dir, filename), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(history[0]))
         writer.writeheader()
         writer.writerows(history)
 
 
-def plot_losses(history, run_dir, series, title, ylabel, smooth=25, baseline=None):
+def plot_losses(
+    history, run_dir, series, title, ylabel, smooth=25, baseline=None, filename="loss_curves.png"
+):
     """
     Plot losses: dense series raw (faint) with a moving average; sparse series
     (logged only on some iterations, e.g. validation) as connected markers.
@@ -405,6 +555,7 @@ def plot_losses(history, run_dir, series, title, ylabel, smooth=25, baseline=Non
         smooth (int): moving-average window in iterations.
         baseline (tuple[float, str] | None): optional (value, label) for a
             dashed horizontal reference line.
+        filename (str): image file name inside run_dir.
     """
     colours = ("#2a78d6", "#e8762b", "#1f9e74")
     fig, ax = plt.subplots(figsize=(9, 3.5), facecolor="#fcfcfb")
@@ -445,7 +596,7 @@ def plot_losses(history, run_dir, series, title, ylabel, smooth=25, baseline=Non
     if ax.get_legend_handles_labels()[0]:
         ax.legend(frameon=False)
     fig.tight_layout()
-    fig.savefig(os.path.join(run_dir, "loss_curves.png"), dpi=120, facecolor="#fcfcfb")
+    fig.savefig(os.path.join(run_dir, filename), dpi=120, facecolor="#fcfcfb")
     plt.close(fig)
 
 
@@ -477,6 +628,7 @@ def main():
     if args.model == "rcgan":
         G, D, history, resources = train_rcgan(args, datasets, device)
         weights = {"generator": G.state_dict(), "discriminator": D.state_dict()}
+        save_losses(history, run_dir)
         plot_losses(
             history,
             run_dir,
@@ -485,19 +637,38 @@ def main():
             "BCE loss",
         )
     else:
-        E, R, history, resources = train_embedding(args, datasets, device)
-        weights = {"embedder": E.state_dict(), "recovery": R.state_dict()}
+        # Phase 1: embedder + recovery autoencoder.
+        E, R, history1, resources = train_embedding(args, datasets, device)
+        save_losses(history1, run_dir, "losses_phase1.csv")
         plot_losses(
-            history,
+            history1,
             run_dir,
             [("recon_mse", "train MSE"), ("val_recon_mse", "validation MSE")],
             "TimeGAN phase 1: reconstruction",
             "MSE (scaled features)",
             baseline=(resources["val_predict_mean_mse"], "val predict-the-mean"),
+            filename="loss_curves_phase1.png",
         )
+        # Phase 2: supervisor on the (frozen) phase 1 embeddings.
+        S, history2, resources2 = train_supervisor(args, datasets, device, E)
+        resources.update(resources2)
+        save_losses(history2, run_dir, "losses_phase2.csv")
+        plot_losses(
+            history2,
+            run_dir,
+            [("sup_mse", "train MSE"), ("val_sup_mse", "validation MSE")],
+            "TimeGAN phase 2: next-step latent prediction",
+            "MSE (latent)",
+            baseline=(resources["val_persistence_mse"], "val persistence (next = current)"),
+            filename="loss_curves_phase2.png",
+        )
+        weights = {
+            "embedder": E.state_dict(),
+            "recovery": R.state_dict(),
+            "supervisor": S.state_dict(),
+        }
     print("resources: " + json.dumps(resources))
 
-    save_losses(history, run_dir)
     config = {
         **vars(args),
         "device": str(device),
