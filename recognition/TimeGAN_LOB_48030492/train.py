@@ -117,7 +117,14 @@ def parse_args():
     )
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--g-steps", type=int, default=2, help="generator steps per discriminator step")
+    p.add_argument("--g-steps", type=int, default=2, help="generator steps per iteration")
+    p.add_argument(
+        "--d-steps",
+        type=int,
+        default=1,
+        help="discriminator steps per iteration (1 = reference code; more helps a D stuck "
+        "at a constant output, see EXP-009/010)",
+    )
     p.add_argument(
         "--d-threshold",
         type=float,
@@ -216,8 +223,9 @@ def train_rcgan(args, datasets, device):
     Each iteration:
         1. args.g_steps generator updates with the non-saturating loss
            BCE(D(G(z, c), c), 1), on fresh real batches (for the ticker ids).
-        2. One discriminator update with BCE(D(x, c), 1) + BCE(D(G(z, c), c), 0),
-           applied only if that loss exceeds args.d_threshold.
+        2. args.d_steps discriminator updates (1 in the reference code), each
+           on a fresh batch, with BCE(D(x, c), 1) + BCE(D(G(z, c), c), 0),
+           each applied only if that loss exceeds args.d_threshold.
 
     Why the threshold and the 2:1 ratio: the discriminator (bidirectional,
     ~3x the generator's parameters) easily becomes near-perfect, at which
@@ -225,6 +233,8 @@ def train_rcgan(args, datasets, device):
     while it is already winning, and giving G extra steps, keeps the two
     players balanced. Both tricks come from the TimeGAN reference code and
     will be used identically for TimeGAN so neither model gets extra help.
+    The opposite problem, a D too weak to leave a constant output (EXP-009/010),
+    is what --d-steps > 1 addresses; it must be set identically for both models.
 
     Generated sequences use the ticker ids of the real batch, so each batch
     compares real and synthetic data for the same mix of stocks.
@@ -281,27 +291,30 @@ def train_rcgan(args, datasets, device):
             g_loss.backward()
             opt_g.step()
 
-        # 2. Discriminator step (fakes detached so G is not updated here).
-        x, ids = next_batch()
-        logits_real = D(x, ids)
-        logits_fake = D(fake_like(x, ids).detach(), ids)
-        d_loss = bce(logits_real, torch.ones_like(logits_real)) + bce(
-            logits_fake, torch.zeros_like(logits_fake)
-        )
-        d_updated = d_loss.item() > args.d_threshold
-        if d_updated:
-            opt_d.zero_grad(set_to_none=True)
-            d_loss.backward()
-            opt_d.step()
+        # 2. Discriminator steps (fakes detached so G is not updated here).
+        d_updates = 0
+        for _ in range(args.d_steps):
+            x, ids = next_batch()
+            logits_real = D(x, ids)
+            logits_fake = D(fake_like(x, ids).detach(), ids)
+            d_loss = bce(logits_real, torch.ones_like(logits_real)) + bce(
+                logits_fake, torch.zeros_like(logits_fake)
+            )
+            if d_loss.item() > args.d_threshold:
+                opt_d.zero_grad(set_to_none=True)
+                d_loss.backward()
+                opt_d.step()
+                d_updates += 1
 
         history.append(
             {
                 "iteration": it,
                 "g_loss": g_loss.item(),
+                # D loss and accuracies from the last discriminator step of the iteration.
                 "d_loss": d_loss.item(),
                 "d_real_acc": (logits_real > 0).float().mean().item(),
                 "d_fake_acc": (logits_fake < 0).float().mean().item(),
-                "d_updated": int(d_updated),
+                "d_updated": d_updates,  # 0..d_steps
             }
         )
         if it % args.log_every == 0 or it == 1:
@@ -321,7 +334,8 @@ def train_rcgan(args, datasets, device):
         "peak_vram_mb": peak_vram_mb(device),
         "params_generator": count_parameters(G),
         "params_discriminator": count_parameters(D),
-        "d_update_rate": float(np.mean([h["d_updated"] for h in history])),
+        # Share of discriminator steps that were applied (not skipped by the threshold).
+        "d_update_rate": float(np.mean([h["d_updated"] for h in history]) / args.d_steps),
     }
     return G, D, history, resources
 
@@ -674,9 +688,12 @@ def train_joint(args, datasets, device, E, R, S):
                 L_E = 10 * sqrt(MSE(x, R(E(x)))) + e_sup_weight * L_S
               so the latent space keeps reconstructing books while staying
               predictable for the supervisor.
-        2. One discriminator step on a fresh batch, on
+        2. args.d_steps discriminator steps (1 in the reference code), each on
+           a fresh batch, on
                 L_D = BCE(D(h), 1) + BCE(D(h_hat), 0) + gamma * BCE(D(e_hat), 0)
-           applied only if L_D exceeds args.d_threshold.
+           each applied only if L_D exceeds args.d_threshold. More than one
+           step departs from the reference code; it is for a discriminator
+           stuck at a constant output (EXP-009/010).
 
     Why each term: the adversarial terms make generated latents look real;
     gamma * BCE on e_hat also trains G directly, without going through S;
@@ -788,24 +805,26 @@ def train_joint(args, datasets, device, E, R, S):
             e_loss.backward()
             opt_er.step()
 
-        # 2. Discriminator step on a fresh batch; generator outputs detached.
-        x, ids = next_batch()
-        with torch.no_grad():
-            h = E(x, ids)
-            e_hat, h_hat = generate(x, ids)
-        logits_real = D(h, ids)
-        logits_fake = D(h_hat, ids)
-        logits_fake_e = D(e_hat, ids)
-        d_loss = (
-            bce(logits_real, torch.ones_like(logits_real))
-            + bce(logits_fake, torch.zeros_like(logits_fake))
-            + args.gamma * bce(logits_fake_e, torch.zeros_like(logits_fake_e))
-        )
-        d_updated = d_loss.item() > args.d_threshold
-        if d_updated:
-            zero_all()
-            d_loss.backward()
-            opt_d.step()
+        # 2. Discriminator steps, each on a fresh batch; generator outputs detached.
+        d_updates = 0
+        for _ in range(args.d_steps):
+            x, ids = next_batch()
+            with torch.no_grad():
+                h = E(x, ids)
+                e_hat, h_hat = generate(x, ids)
+            logits_real = D(h, ids)
+            logits_fake = D(h_hat, ids)
+            logits_fake_e = D(e_hat, ids)
+            d_loss = (
+                bce(logits_real, torch.ones_like(logits_real))
+                + bce(logits_fake, torch.zeros_like(logits_fake))
+                + args.gamma * bce(logits_fake_e, torch.zeros_like(logits_fake_e))
+            )
+            if d_loss.item() > args.d_threshold:
+                zero_all()
+                d_loss.backward()
+                opt_d.step()
+                d_updates += 1
 
         history.append(
             {
@@ -816,10 +835,11 @@ def train_joint(args, datasets, device, E, R, S):
                 "g_loss_s": loss_s.item(),
                 "g_loss_v": loss_v.item(),
                 "e_recon_mse": recon_mse.item(),
+                # D loss and accuracies from the last discriminator step of the iteration.
                 "d_loss": d_loss.item(),
                 "d_real_acc": (logits_real > 0).float().mean().item(),
                 "d_fake_acc": (logits_fake < 0).float().mean().item(),
-                "d_updated": int(d_updated),
+                "d_updated": d_updates,  # 0..d_steps
             }
         )
         if it % args.log_every == 0 or it == 1:
@@ -841,7 +861,8 @@ def train_joint(args, datasets, device, E, R, S):
         "phase3_peak_vram_mb": peak_vram_mb(device),
         "params_generator": count_parameters(G),
         "params_discriminator": count_parameters(D),
-        "d_update_rate": float(np.mean([row["d_updated"] for row in history])),
+        # Share of discriminator steps that were applied (not skipped by the threshold).
+        "d_update_rate": float(np.mean([row["d_updated"] for row in history]) / args.d_steps),
     }
     return G, D, history, resources
 
