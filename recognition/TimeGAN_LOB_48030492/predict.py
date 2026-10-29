@@ -30,12 +30,19 @@ Metrics per ticker (CLAUDE.md "Evaluation"):
     resources         generation time, sequences per second, peak VRAM
 
 Outputs (in --out-dir, default <run-dir>/eval):
-    metrics.json, metrics_summary.md, depth_heatmaps.png, acf_abs_returns.png,
-    spread_distribution.png
+    metrics.json, metrics_summary.md        all metrics; README-ready table
+    depth_heatmaps.png                      real vs generated depth surfaces
+    acf_abs_returns.png                     volatility clustering
+    spread_distribution.png                 spread in ticks
+    vwap_paths.png                          VWAP and mid paths, same starting price
+    vwap_stats.png                          per-ticker VWAP variance and VWAP - mid
+    gifs/depth_<TICKER>.gif                 animated depth chart, real vs generated
+                                            (skip with --no-gifs)
 
 Usage:
     python predict.py --run-dir runs/<run-name> --data-dir data
     python predict.py --run-dir runs/<run-name> --data-dir data --n-samples 64 --seq-len 500
+    python predict.py --run-dir runs/<run-name> --data-dir data --no-gifs   # faster
 """
 
 import argparse
@@ -44,6 +51,7 @@ import os
 import time
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 import numpy as np
 import torch
 
@@ -61,7 +69,8 @@ from modules import Generator, RCGANGenerator, Recovery, Supervisor, sample_nois
 
 # Plot styling, shared with the other project figures.
 SURFACE, TEXT, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-REAL, SYNTH = "#2a78d6", "#e8762b"
+REAL, SYNTH, REF = "#2a78d6", "#e8762b", "#9a9893"
+BID, ASK, VWAP_LINE = "#2a78d6", "#e8762b", "#1f9e74"
 ACF_LAGS = 60
 HORIZON = 100  # steps compared at the start vs the end of each sequence
 
@@ -77,6 +86,8 @@ def parse_args():
     p.add_argument("--device", default="auto", help="'auto', 'cuda' or 'cpu'")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default=None, help="default: <run-dir>/eval")
+    p.add_argument("--no-gifs", action="store_true", help="skip the animated depth GIFs")
+    p.add_argument("--gif-every", type=int, default=5, help="steps between GIF frames")
     return p.parse_args()
 
 
@@ -309,6 +320,119 @@ def plot_spreads(spreads, path):
     plt.close(fig)
 
 
+def plot_vwap_paths(paths, path):
+    """
+    Book VWAP and mid paths: one real segment vs generated sequences that
+    start from the same real mid price, one panel per ticker.
+
+    Args:
+        paths (dict): ticker -> (real book, list of generated books), books as
+            (ask, bid, ask_size, bid_size) tuples.
+        path (str): output file.
+    """
+    fig, axes = plt.subplots(len(paths), 1, figsize=(10, 2.3 * len(paths)), facecolor=SURFACE,
+                             squeeze=False)
+    for ax, (t, (real, synths)) in zip(axes[:, 0], paths.items()):
+        style(ax, t)
+        steps = np.arange(1, len(real[0]) + 1)
+        for book, colour, label, alpha in [(real, REAL, "real", 1.0)] + [
+            (b, SYNTH, "generated" if i == 0 else None, 0.9 if i == 0 else 0.35)
+            for i, b in enumerate(synths)
+        ]:
+            ax.plot(steps, utils.vwap(*book)["book"], color=colour, linewidth=1.4, alpha=alpha,
+                    label=None if label is None else f"{label} VWAP")
+            ax.plot(steps, utils.mid_price(book[0], book[1]), color=colour, linewidth=0.8,
+                    linestyle=(0, (2, 2)), alpha=alpha, label=None if label is None else f"{label} mid")
+        ax.set_ylabel("Price ($)", color=MUTED, fontsize=8)
+    axes[0, 0].legend(frameon=False, fontsize=8, labelcolor=TEXT, ncol=4, loc="upper left")
+    axes[-1, 0].set_xlabel("Step (s)", color=MUTED, fontsize=8)
+    fig.suptitle("Book VWAP (solid) and mid (dashed): real vs generated from the same starting mid",
+                 x=0.01, ha="left", color=TEXT)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def plot_vwap_stats(results, path):
+    """
+    Per-ticker VWAP statistics (staff metric 3): within-sequence VWAP variance
+    and mean VWAP - mid distance, for the real test hour, the other real hour
+    (reference) and the generated books. Both are level-free checks that
+    tickers stay distinct rather than collapsing to one value.
+    """
+    tickers = list(results["tickers"])
+    groups = (("real", "real (scored hour)", REAL), ("real_other_hour", "real (other hour)", REF),
+              ("generated", "generated", SYNTH))
+    x = np.arange(len(tickers))
+    width = 0.27
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.4), facecolor=SURFACE)
+    style(ax1, "Within-sequence VWAP variance ($², log scale)")
+    style(ax2, "Mean VWAP - mid (ticks)")
+    for j, (key, label, colour) in enumerate(groups):
+        var = [results["tickers"][t][key]["vwap_var_within_seq"] for t in tickers]
+        dist = [results["tickers"][t][key]["vwap_minus_mid_ticks"] for t in tickers]
+        ax1.bar(x + (j - 1) * width, var, width, color=colour, label=label)
+        ax2.bar(x + (j - 1) * width, dist, width, color=colour, label=label)
+    ax1.set_yscale("log")
+    ax2.axhline(0, color=MUTED, linewidth=0.6)
+    for ax in (ax1, ax2):
+        ax.set_xticks(x, tickers)
+    ax1.legend(frameon=False, fontsize=8, labelcolor=TEXT)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def make_depth_gif(real, synth, ticker, path, every=5):
+    """
+    Animated depth chart, real vs generated side by side (CLAUDE.md
+    "Visualisation"): at each frame, bars of bid and ask volume at each
+    price level, with vertical lines for the mid and the book VWAP.
+
+    Both panels start from the same real mid. Axis limits are fixed for the
+    whole animation (prices: 1st-99th percentile of each book's levels;
+    volume: 99th percentile of both), so movement in the chart is movement in
+    the book, not in the axes.
+
+    Args:
+        real, synth (tuple): (ask, bid, ask_size, bid_size) books, each (L, n).
+        ticker (str): for the title.
+        path (str): output .gif file.
+        every (int): steps between frames (500 steps / 5 = 100 frames).
+    """
+    books = (("real", real), ("generated", synth))
+    frames = range(0, len(real[0]), every)
+    vmax = np.percentile(np.concatenate([np.concatenate([b[2], b[3]]) for _, b in books]), 99) * 1.1
+    xlims = []
+    for _, (ask, bid, _, _) in books:
+        lo, hi = np.percentile(bid, 1), np.percentile(ask, 99)
+        pad = 0.05 * (hi - lo) + 1e-9
+        xlims.append((lo - pad, hi + pad))
+
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3), facecolor=SURFACE)
+
+    def draw(k):
+        for ax, (name, (ask, bid, va, vb)), xlim in zip(axes, books, xlims):
+            ax.clear()
+            style(ax, f"{ticker} {name}  step {k + 1}")
+            width = (xlim[1] - xlim[0]) / 70
+            ax.bar(bid[k], vb[k], width=width, color=BID, label="bid volume")
+            ax.bar(ask[k], va[k], width=width, color=ASK, label="ask volume")
+            ax.axvline(utils.mid_price(ask[k : k + 1], bid[k : k + 1])[0], color=TEXT, linewidth=1,
+                       label="mid")
+            ax.axvline(utils.vwap(ask[k : k + 1], bid[k : k + 1], va[k : k + 1], vb[k : k + 1])["book"][0],
+                       color=VWAP_LINE, linewidth=1, linestyle=(0, (3, 2)), label="book VWAP")
+            ax.set_xlim(xlim)
+            ax.set_ylim(0, vmax)
+            ax.set_xlabel("Price ($)", color=MUTED, fontsize=8)
+        axes[0].set_ylabel("Volume (shares)", color=MUTED, fontsize=8)
+        axes[1].legend(frameon=False, fontsize=7, labelcolor=TEXT, loc="upper right")
+
+    anim = FuncAnimation(fig, draw, frames=frames)
+    anim.save(path, writer=PillowWriter(fps=10), dpi=60, savefig_kwargs={"facecolor": SURFACE})
+    plt.close(fig)
+
+
 def summary_markdown(results, cfg, args):
     """Key metrics as a GitHub-markdown table: generated vs real-vs-real reference."""
     lines = [
@@ -365,7 +489,7 @@ def main():
 
     results = {"run_dir": args.run_dir, "model": cfg["model"], "split": args.split,
                "n_samples": args.n_samples, "seq_len": args.seq_len, "tickers": {}}
-    examples, acf_curves, spread_dists = {}, {}, {}
+    examples, acf_curves, spread_dists, vwap_paths = {}, {}, {}, {}
     gen_seconds = 0.0
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -405,7 +529,9 @@ def main():
             "reference": ref,
             "reference_segments": k,
         }
-        examples[ticker] = (real[0], synth[0])
+        examples[ticker] = (real[0], synth[0])  # same starting mid (anchor 0)
+        # Up to three generated sequences that start from real segment 0's mid.
+        vwap_paths[ticker] = (real[0], synth[0 : args.n_samples : len(anchors)][:3])
         acf_curves[ticker] = (r_arr["acf_abs"], g_arr["acf_abs"])
         spread_dists[ticker] = (r_arr["spread"], g_arr["spread"])
         print(f"{ticker}: violations {g_stats['violations']['any']:.1%}  "
@@ -429,6 +555,15 @@ def main():
     plot_heatmaps(examples, os.path.join(out_dir, "depth_heatmaps.png"))
     plot_acf(acf_curves, os.path.join(out_dir, "acf_abs_returns.png"))
     plot_spreads(spread_dists, os.path.join(out_dir, "spread_distribution.png"))
+    plot_vwap_paths(vwap_paths, os.path.join(out_dir, "vwap_paths.png"))
+    plot_vwap_stats(results, os.path.join(out_dir, "vwap_stats.png"))
+    if not args.no_gifs:
+        gif_dir = os.path.join(out_dir, "gifs")
+        os.makedirs(gif_dir, exist_ok=True)
+        for ticker, (real_book, synth_book) in examples.items():
+            make_depth_gif(real_book, synth_book, ticker, os.path.join(gif_dir, f"depth_{ticker}.gif"),
+                           args.gif_every)
+            print(f"saved depth GIF for {ticker}")
     print(summary)
     print(f"saved metrics and figures to {out_dir}")
 
