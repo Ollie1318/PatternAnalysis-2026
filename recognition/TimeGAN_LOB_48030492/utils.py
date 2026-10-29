@@ -38,6 +38,80 @@ def book_arrays(grid, n_levels=10):
     return cols("ask_price"), cols("bid_price"), cols("ask_size"), cols("bid_size")
 
 
+def decode_features(features, anchor_mid, representation, n_levels=10):
+    """
+    Decode one sequence of (unscaled) features back into a full order book.
+
+    Inverse of dataset.compute_features. The mid path is rebuilt from the
+    log-returns, starting from a real mid price (the anchor), because the
+    features only hold returns, not the price level:
+        m_k = anchor_mid * exp(r_1 + ... + r_k)
+    Prices are then rebuilt relative to m_k and sizes are exp(log size).
+
+        unconstrained  a_i = m_k (1 + ask_offset_i),  b_i = m_k (1 + bid_offset_i)
+                       (nothing forces a valid book: the model must learn it)
+        constrained    a_1 = m_k (1 + s / 2), b_1 = m_k (1 - s / 2), s = exp(log_spread);
+                       a_{i+1} = a_i + m_k exp(ask_log_gap_i),
+                       b_{i+1} = b_i - m_k exp(bid_log_gap_i)
+                       (valid by construction)
+
+    Args:
+        features (np.ndarray): (T, F) raw features in dataset.feature_columns
+            order (after invert_minmax for model output).
+        anchor_mid (float): real mid price in dollars at the step before the
+            first row.
+        representation (str): "unconstrained" or "constrained".
+        n_levels (int): book depth.
+
+    Returns:
+        tuple of four (T, n_levels) arrays: ask, bid, ask_size, bid_size
+        (prices in dollars, sizes in shares), the format every metric uses.
+
+    Raises:
+        ValueError: for an unknown representation or a wrong feature count.
+    """
+    f = np.asarray(features, dtype=float)
+    n = n_levels
+    expected = {"unconstrained": 1 + 4 * n, "constrained": 4 * n}
+    if representation not in expected:
+        raise ValueError(f"unknown representation {representation!r}")
+    if f.shape[1] != expected[representation]:
+        raise ValueError(f"expected {expected[representation]} features, got {f.shape[1]}")
+
+    m = anchor_mid * np.exp(np.cumsum(f[:, 0]))[:, None]  # (T, 1) mid path
+    if representation == "unconstrained":
+        ask = m * (1 + f[:, 1 : 1 + n])
+        bid = m * (1 + f[:, 1 + n : 1 + 2 * n])
+        sizes = f[:, 1 + 2 * n :]
+    else:
+        half_spread = m * np.exp(f[:, 1:2]) / 2  # (T, 1)
+        ask_gaps = m * np.exp(f[:, 2 : 1 + n])  # (T, n - 1)
+        bid_gaps = m * np.exp(f[:, 1 + n : 2 * n])  # (T, n - 1)
+        ask = (m + half_spread) + np.concatenate([np.zeros_like(m), np.cumsum(ask_gaps, 1)], 1)
+        bid = (m - half_spread) - np.concatenate([np.zeros_like(m), np.cumsum(bid_gaps, 1)], 1)
+        sizes = f[:, 2 * n :]
+    return ask, bid, np.exp(sizes[:, :n]), np.exp(sizes[:, n:])
+
+
+def tick_misalignment(prices, tick=TICK):
+    """
+    Mean distance of prices from the nearest tick, in ticks (0 to 0.5).
+
+    Real prices always lie exactly on the $0.01 grid (0). Decoded synthetic
+    prices are continuous, so this shows how far they sit from valid prices;
+    uniformly random prices would give about 0.25.
+
+    Args:
+        prices (np.ndarray): any shape, in dollars.
+        tick (float): tick size in dollars.
+
+    Returns:
+        float.
+    """
+    x = np.asarray(prices) / tick
+    return float(np.abs(x - np.rint(x)).mean())
+
+
 def mid_price(ask, bid):
     """Mid price (a_1 + b_1) / 2. Args: (T, n) arrays. Returns: (T,)."""
     return (ask[:, 0] + bid[:, 0]) / 2
