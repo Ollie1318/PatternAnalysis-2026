@@ -88,7 +88,7 @@ All runs use the same chronological splits (train 09:30–14:00, validation
 - **Commit:** f9c3f5b (cloned from GitHub into a Kaggle notebook)
 - **Model / representation:** conditional TimeGAN Embedder + Recovery (phase 1), unconstrained, global min-max (0.5/99.5% bounds, winsorised), all five tickers
 - **Config:** six runs, hidden dim {24, 64, 164} x latent dim {24, 41}; otherwise as EXP-003: layers 3, cond dim 8, batch 128, seq len 24, stride 1, Adam lr 1e-3, 10,000 phase 1 iterations, seed 0. Phase 2 was cut to 1 iteration (`--sup-iterations 1`) because only phase 1 was being tested; the phase 2 numbers in these runs are meaningless. Run names `ae_sweep_h<H>_k<K>`.
-- **Compute:** Kaggle notebook, NVIDIA Tesla T4, PyTorch 2.11.0+cu128 (a different version from the T4 VM's 2.14.1+cu126; other package versions to be recorded).
+- **Compute:** Kaggle notebook with 2 x NVIDIA Tesla T4 (15 GB each; the code uses only the first). Python 3.13.15, PyTorch 2.11.0+cu128 (CUDA 12.8), NumPy 2.1.3, pandas 2.3.3, matplotlib 3.10.0. This differs from the T4 VM's Python 3.10.21 / PyTorch 2.14.1+cu126.
 
   | Hidden / latent | Phase 1 time | Peak VRAM | E + R params |
   |---|---|---|---|
@@ -110,5 +110,35 @@ All runs use the same chronological splits (train 09:30–14:00, validation
   - The EXP-003/004 underfitting was mainly a capacity problem: the networks (hidden 24), more than the latent bottleneck, were too small.
   - Cost rises sharply: hidden 164 is about 6x slower in phase 1 (391 s vs 66 s), uses 1.37 GB of VRAM for E + R alone, and has 34x the parameters. With all five networks in phase 3, a full TimeGAN run at this size will probably exceed feasibility criterion 5 (< 30 min, < 2 GB on one T4); to be measured and reported.
   - The original T4 VM was unavailable, so this sweep ran on Kaggle; its PyTorch version differs, so timings are not strictly comparable with EXP-002/003/005.
-  - The diagnostics script is not yet in the repo.
 - **What was tried next:** adopt hidden 164 / latent 41 for TimeGAN. Hidden 164 is the paper's 4 x features; latent 41 departs from the paper's ½ x features ≈ 20, justified by this sweep. RCGAN must use the same hidden size so both keep the same backbone. Candidates: a 20,000-iteration phase 1 at 164 / 41 to check the gain from training longer; moving the diagnostics into the repo; then phase 2 at the new size.
+
+### EXP-007 — TimeGAN phases 1 + 2 at hidden 164 / latent 41 (20,000 + 10,000 iterations), Kaggle T4
+- **Date:** 2026-10-30
+- **Commit:** 52175f2 (`train.py` identical to f9c3f5b; phase 3 not yet implemented, so the run stopped after phase 2)
+- **Model / representation:** conditional TimeGAN Embedder + Recovery (phase 1), then Supervisor on frozen embeddings (phase 2); unconstrained, global min-max (0.5/99.5% bounds, winsorised), all five tickers
+- **Config:** hidden 164, latent 41 (chosen in EXP-006), layers 3 (supervisor 2), cond dim 8, batch 128, seq len 24, stride 1, Adam lr 1e-3, **20,000 phase 1 iterations** (double EXP-006, because its loss was still falling at 10,000), 10,000 phase 2 iterations, seed 0; run name `timegan_h164_k41_p12`
+- **Compute:** Kaggle T4, same environment as EXP-006 (Python 3.13.15, PyTorch 2.11.0+cu128). Phase 1: 782 s (0.039 s/iteration), peak VRAM 1,371 MB. Phase 2: 261 s (0.026 s/iteration), peak VRAM 1,135 MB. Params E 437,305 / R 437,305 / S 274,945.
+- **Result:** diagnostics on the full validation set (17,885 windows), saved to `runs/timegan_h164_k41_p12/diagnostics.json`.
+  - **Phase 1: training longer paid off.** Val MSE kept falling well past 10,000 iterations (0.00083 at 10k, 0.00030 at 12.5k, 0.00016 at 15k) and was levelling off by 20,000 (0.00011 at 19k, **0.00010** at 20k). Per ticker it is now **18-40x better than the static-book baseline** (AMZN 0.00013 vs 0.0052; INTC 0.00003 vs 0.0002), compared with at most 5x at 10,000 iterations (EXP-006). Within-ticker explained variance: log sizes 0.94-0.99, price offsets 0.88-0.95, mid log-return 0.96-1.00; non-zero return moves reconstructed with correlation 0.99-1.00 at 95-102% of their true size. Train and val MSE stay together (last 1,000 iterations 0.00014 / 0.00011): no overfitting.
+  - **Phase 2: the supervisor beats persistence for every ticker**, by 1.12x (AMZN), 1.20x (AAPL), 1.13x (GOOG), 1.53x (INTC) and 1.49x (MSFT) (val next-step MSE vs "next latent = current latent"). In the small-model test (hidden 24, 600 iterations) it had been ~4x *worse* than persistence for INTC/MSFT. Val MSE fell quickly (0.0123 at iteration 1, 0.0022 at 500) and reached its best of 0.00196 at iteration 4,450.
+- **What went wrong / observations:**
+  - Phase 2 starts to overfit after ~4,500 iterations: train MSE keeps falling (0.00239 at 2-3k -> 0.00221 at 9-10k) while val drifts up slightly (0.00197 -> 0.00199). The effect is small, but ~5,000 phase 2 iterations would be enough.
+  - The supervisor's margin over persistence is modest for AMZN/AAPL/GOOG (12-20%): most of what can be predicted one second ahead is "the book stays roughly the same".
+  - With latent 41 = number of features and near-perfect reconstruction, the latent space is not compressed; TimeGAN's "compact latent space" argument (paper Section 4.1) therefore carries less weight here, and the latent is close to a smooth re-coding of the features. Worth noting in the README when comparing with RCGAN.
+  - Persistence MSE (0.0024 pooled) is not comparable with earlier runs, because each run learns a different latent space; only the supervisor-to-persistence ratio is comparable.
+  - Phase 1 at this length is the most expensive phase so far (13 min); every TimeGAN run currently retrains phases 1 and 2 from scratch.
+- **What was tried next:** phase 3 (joint training) implemented in 4dbdbd9; first a short phase 3 smoke test at this size to measure time per iteration and VRAM before a full run. Settings for later runs: 20,000 phase 1 iterations, ~5,000 phase 2 iterations.
+
+### EXP-008 — TimeGAN phase 3 smoke test at hidden 164 / latent 41, Kaggle T4
+- **Date:** 2026-10-30
+- **Commit:** 4dbdbd9 (first version of phase 3 joint training)
+- **Model / representation:** full conditional TimeGAN (all five networks), unconstrained, global min-max (0.5/99.5% bounds, winsorised), all five tickers
+- **Config:** hidden 164, latent 41, layers 3 (supervisor 2), cond dim 8, z dim 41 (U(0,1)), batch 128, seq len 24, stride 1, Adam lr 1e-3. Phases 1 and 2 deliberately short (1,000 and 500 iterations), because this run only measures phase 3's cost and early behaviour; phase 3: 300 iterations, 2 G steps per D step, D threshold 0.15, reference-code loss weights (gamma 1, 100·sqrt(L_S), 100·L_V, 0.1·L_S for E); seed 0; run name `timegan_h164_k41_p3smoke`
+- **Compute:** Kaggle T4, same environment as EXP-006/007. Phase 3: 143 s = **0.48 s/iteration**, **peak VRAM 526 MB**. Phases 1/2: 46 s / 14 s. Params E 437,305 / R 437,305 / S 274,945 / G 437,305 / D 1,184,121 (2.77M in total).
+- **Result:** phase 3 runs end to end on the GPU with all outputs saved; no NaN or infinite losses. Mean losses per 100 iterations stay roughly flat: D loss 1.76-1.85, G adversarial loss 1.11-1.23 (on supervised fakes) and 1.28-1.50 (on raw fakes), supervised loss ~0.003, moment loss 0.027-0.030, reconstruction MSE ~0.006. Far too short to judge sample quality.
+- **What went wrong / observations:**
+  - **Cost:** at 0.48 s/iteration, 10,000 phase 3 iterations would take ~80 min; with phase 1 at 20,000 iterations (13 min, EXP-007), a full run is far above feasibility criterion 5 (< 30 min). Each phase 3 iteration runs two G+S steps and two E+R steps through all five networks, plus a D step, at hidden 164.
+  - **VRAM is not a problem:** phase 3 peaks at 526 MB. The 1,371 MB reported for phase 1 comes from computing validation loss on 2,048 windows in one batch, not from training.
+  - **Discriminator behaviour:** D classifies almost everything as fake (accuracy on real 0.09-0.23, on fake 0.94-0.96, per 100 iterations). Its loss never comes near the 0.15 threshold, so it was updated on 100% of iterations and the threshold never acted. With weak phases 1/2 and only 300 iterations this is not yet a failure, but to be watched in longer runs.
+  - Phases 1 and 2 were re-run from scratch only for this test; every full run would otherwise repeat ~17 min of phases 1 and 2.
+- **What was tried next:** `--init-from` (3b22cd0) to start phase 3 from the trained EXP-007 checkpoint; then a 2,000-iteration phase 3 run (~16 min) before any 10,000-iteration run, and a `predict.py` to evaluate generated books.
