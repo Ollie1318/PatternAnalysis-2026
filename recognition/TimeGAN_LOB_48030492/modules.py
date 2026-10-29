@@ -410,10 +410,12 @@ class Supervisor(nn.Module):
 
     Output step t is the prediction of latent step t + 1, given steps 1..t (the
     GRU runs forwards only, so it cannot look ahead). The supervised loss is
-    therefore ||h[:, 1:] - S(h)[:, :-1]||^2 on real embeddings (phase 2), and
-    the same loss on generated latents pushes G towards real one-step
-    transitions (phase 3). This is the paper's answer to an adversarial loss
-    alone not capturing step-wise conditional distributions.
+    therefore ||h[:, 1:] - S(h)[:, :-1]||^2 on real embeddings, in phase 2
+    and again in phase 3. In the reference code this loss is only ever
+    computed on real embeddings; generated sequences get S's learned dynamics
+    because the generator's output is passed through S (h_hat = S(G(z))).
+    This is the paper's answer to an adversarial loss alone not capturing
+    step-wise conditional distributions.
 
     The reference code gives the supervisor one GRU layer fewer than the other
     networks (num_layer - 1), hence the default of 2 layers here.

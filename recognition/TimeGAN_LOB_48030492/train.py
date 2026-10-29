@@ -6,11 +6,11 @@ Models (--model):
              RCGANDiscriminator), trained on adversarial (BCE) loss only,
              following Esteban, Hyland & Raetsch (2017).
     timegan  TimeGAN (Yoon, Jarrett & van der Schaar 2019), trained in three
-             phases. Current stage: phase 1 (embedder + recovery autoencoder)
-             then phase 2 (supervisor on real embeddings); phase 3 (joint
-             adversarial training) will be added next and will share the
-             RCGAN loop's stabilisation tricks, logging and checkpointing, so
-             the comparison is fair.
+             phases: (1) embedder + recovery autoencoder, (2) supervisor on
+             real embeddings, (3) joint adversarial training of all five
+             networks. Phase 3 uses the same 2:1 generator/discriminator
+             schedule and D-loss threshold as the RCGAN loop, so the
+             comparison is fair.
 
 Runs on GPU when available and falls back to CPU (--device auto), so the same
 command works locally for smoke tests and on Rangpur for full runs.
@@ -26,7 +26,8 @@ Each run writes to --out-dir/<run-name>/ (gitignored under runs/):
 Usage:
     python train.py --data-dir data --iterations 2000
     python train.py --data-dir data --iterations 50 --device cpu   # quick smoke test
-    python train.py --data-dir data --model timegan --ae-iterations 10000 --sup-iterations 10000
+    python train.py --data-dir data --model timegan --ae-iterations 10000 \
+        --sup-iterations 10000 --iterations 10000
 """
 
 import argparse
@@ -43,7 +44,9 @@ from torch import nn
 
 from dataset import TICKERS, build_datasets, make_dataloader
 from modules import (
+    Discriminator,
     Embedder,
+    Generator,
     RCGANDiscriminator,
     RCGANGenerator,
     Recovery,
@@ -80,7 +83,12 @@ def parse_args():
     )
     p.add_argument("--noise", default="uniform", choices=("uniform", "normal"))
     # Optimisation
-    p.add_argument("--iterations", type=int, default=2000, help="generator update rounds")
+    p.add_argument(
+        "--iterations",
+        type=int,
+        default=2000,
+        help="adversarial iterations (RCGAN, or TimeGAN phase 3)",
+    )
     p.add_argument(
         "--ae-iterations",
         type=int,
@@ -107,6 +115,22 @@ def parse_args():
         type=float,
         default=0.15,
         help="only update D when its loss exceeds this (TimeGAN reference code)",
+    )
+    # TimeGAN phase 3 loss weights (defaults: reference code timegan.py; see train_joint)
+    p.add_argument(
+        "--gamma", type=float, default=1.0, help="weight of the loss on unsupervised fakes D(G(z))"
+    )
+    p.add_argument(
+        "--sup-weight", type=float, default=100.0, help="weight of sqrt(supervised loss) in G's loss"
+    )
+    p.add_argument(
+        "--moment-weight", type=float, default=100.0, help="weight of the moment loss in G's loss"
+    )
+    p.add_argument(
+        "--e-sup-weight",
+        type=float,
+        default=0.1,
+        help="weight of the supervised loss in the embedder's phase 3 loss",
     )
     p.add_argument("--balanced", action="store_true", help="ticker-balanced sampling")
     # Run
@@ -424,7 +448,8 @@ def train_supervisor(args, datasets, device, E):
     The reference code hands both G's and S's parameters to this phase's
     optimiser, but the loss only involves real embeddings, so G receives no
     gradient and is unchanged; only S is trained here. G is first trained in
-    phase 3, where this loss is applied to its own latents.
+    phase 3 (adversarially), where S keeps training on this loss and every
+    generated sequence is passed through S.
 
     Validation loss is compared with a persistence baseline, predicting
     h[:, t + 1] = h[:, t]. Books change little from one second to the next, so
@@ -529,6 +554,223 @@ def train_supervisor(args, datasets, device, E):
         "final_val_sup_by_ticker": by_ticker,
     }
     return S, history, resources
+
+
+def moment_loss(x_hat, x):
+    """
+    TimeGAN moment-matching loss (reference code, G_loss_V = V1 + V2).
+
+    Compares the mean and standard deviation of each (time step, feature)
+    across the batch, so the generator matches the first two moments of the
+    real feature distribution:
+        V1 = mean |std(x_hat) - std(x)|,   V2 = mean |mean(x_hat) - mean(x)|
+    with 1e-6 added to the variances before the square root, as in the
+    reference code, to keep gradients finite.
+
+    Args:
+        x_hat (torch.Tensor): (B, T, F) synthetic features.
+        x (torch.Tensor): (B, T, F) real features.
+
+    Returns:
+        torch.Tensor, scalar.
+    """
+    v1 = (
+        torch.sqrt(x_hat.var(dim=0, unbiased=False) + 1e-6)
+        - torch.sqrt(x.var(dim=0, unbiased=False) + 1e-6)
+    ).abs().mean()
+    v2 = (x_hat.mean(dim=0) - x.mean(dim=0)).abs().mean()
+    return v1 + v2
+
+
+def train_joint(args, datasets, device, E, R, S):
+    """
+    TimeGAN phase 3: joint training of all five networks.
+
+    Notation: x real features, c ticker, h = E(x, c) real latents,
+    e_hat = G(z, c) raw generated latents, h_hat = S(e_hat, c) supervised
+    generated latents, x_hat = R(h_hat, c) generated features.
+
+    Each iteration (reference code, timegan.py, joint training):
+        1. args.g_steps times, on a fresh real batch:
+           a. generator + supervisor step on
+                L_G = BCE(D(h_hat), 1) + gamma * BCE(D(e_hat), 1)
+                      + sup_weight * sqrt(L_S) + moment_weight * L_V
+              with L_S = MSE(h[:, 1:], S(h)[:, :-1]) the phase 2 loss on
+              real latents and L_V = moment_loss(x_hat, x);
+           b. embedder + recovery step on the same batch, on
+                L_E = 10 * sqrt(MSE(x, R(E(x)))) + e_sup_weight * L_S
+              so the latent space keeps reconstructing books while staying
+              predictable for the supervisor.
+        2. One discriminator step on a fresh batch, on
+                L_D = BCE(D(h), 1) + BCE(D(h_hat), 0) + gamma * BCE(D(e_hat), 0)
+           applied only if L_D exceeds args.d_threshold.
+
+    Why each term: the adversarial terms make generated latents look real;
+    gamma * BCE on e_hat also trains G directly, without going through S;
+    the moment term is a cheap check that feature means and spreads match.
+    The supervised term L_S is computed on *real* latents h, exactly as in the
+    reference code, so it keeps training S (and, in step b, E) to model real
+    step-to-step transitions, but sends no gradient to G. G benefits from it
+    indirectly: its output always passes through S (h_hat = S(e_hat)) before
+    D and R see it, so S's learned dynamics shape every generated sequence. The 2:1 schedule and the
+    D threshold stop the discriminator from overpowering the generator, and
+    are identical to the RCGAN baseline so neither model gets extra help.
+
+    Loss weights: defaults follow the reference code (gamma 1, 100 * sqrt(L_S),
+    100 * L_V, 0.1 * L_S for E). The paper instead writes lambda = 1 and
+    eta = 10 as weights on L_S (Section 4.3); all four are arguments.
+
+    Each optimiser only updates its own networks, as in the reference code
+    (G_solver: G + S, E_solver: E + R, D_solver: D). Gradients from one loss
+    that reach other networks (e.g. L_G into D) are discarded by zeroing every
+    network's gradients before each backward pass.
+
+    Args:
+        args (argparse.Namespace): see parse_args.
+        datasets (dict): "train" / "val" / "test" LOBWindowDataset.
+        device (torch.device): where to train.
+        E, R (modules.Embedder, modules.Recovery): trained in phase 1.
+        S (modules.Supervisor): trained in phase 2.
+
+    Returns:
+        tuple: (generator, discriminator, list of per-iteration loss dicts,
+        resources dict). E, R and S are updated in place.
+    """
+    train_set = datasets["train"]
+    feature_dim = train_set.windows.shape[-1]
+    z_dim = args.z_dim or feature_dim  # reference code: noise size = feature count
+    n_tickers = len(TICKERS)  # ids follow TICKERS order whatever subset is loaded
+
+    G = Generator(
+        z_dim, n_tickers, E.latent_dim, args.cond_dim, args.hidden_dim, args.num_layers
+    ).to(device)
+    D = Discriminator(
+        n_tickers, E.latent_dim, args.cond_dim, args.hidden_dim, args.num_layers
+    ).to(device)
+    E.requires_grad_(True)  # frozen during phase 2; trained again here
+    nets = (E, R, S, G, D)
+
+    opt_gs = torch.optim.Adam(list(G.parameters()) + list(S.parameters()), lr=args.lr)
+    opt_er = torch.optim.Adam(list(E.parameters()) + list(R.parameters()), lr=args.lr)
+    opt_d = torch.optim.Adam(D.parameters(), lr=args.lr)
+    bce = nn.BCEWithLogitsLoss()  # mean over batch and time steps
+    mse = nn.MSELoss()
+
+    loader = make_dataloader(
+        train_set, args.batch_size, shuffle=True, balanced=args.balanced, seed=args.seed
+    )
+    batches = infinite_batches(loader)
+
+    def next_batch():
+        x, ids = next(batches)
+        return x.to(device, non_blocking=True), ids.to(device, non_blocking=True)
+
+    def zero_all():
+        for net in nets:
+            net.zero_grad(set_to_none=True)
+
+    def generate(x, ids):
+        """Raw and supervised generated latents for a batch shaped like x."""
+        z = sample_noise(x.size(0), x.size(1), z_dim, args.noise, device=device)
+        e_hat = G(z, ids)  # (B, T, K)
+        return e_hat, S(e_hat, ids)
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    history = []
+    start = time.perf_counter()
+
+    for it in range(1, args.iterations + 1):
+        # 1. Generator/supervisor and embedder/recovery steps.
+        for _ in range(args.g_steps):
+            x, ids = next_batch()
+
+            # 1a. G + S.
+            h = E(x, ids)
+            loss_s = mse(S(h, ids)[:, :-1], h[:, 1:])
+            e_hat, h_hat = generate(x, ids)
+            x_hat = R(h_hat, ids)
+            logits_fake = D(h_hat, ids)
+            logits_fake_e = D(e_hat, ids)
+            loss_u = bce(logits_fake, torch.ones_like(logits_fake))
+            loss_u_e = bce(logits_fake_e, torch.ones_like(logits_fake_e))
+            loss_v = moment_loss(x_hat, x)
+            g_loss = (
+                loss_u
+                + args.gamma * loss_u_e
+                + args.sup_weight * torch.sqrt(loss_s)
+                + args.moment_weight * loss_v
+            )
+            zero_all()
+            g_loss.backward()
+            opt_gs.step()
+
+            # 1b. E + R, recomputed after the G/S update (as in the reference code).
+            h = E(x, ids)
+            recon_mse = mse(R(h, ids), x)
+            e_loss = 10 * torch.sqrt(recon_mse) + args.e_sup_weight * mse(
+                S(h, ids)[:, :-1], h[:, 1:]
+            )
+            zero_all()
+            e_loss.backward()
+            opt_er.step()
+
+        # 2. Discriminator step on a fresh batch; generator outputs detached.
+        x, ids = next_batch()
+        with torch.no_grad():
+            h = E(x, ids)
+            e_hat, h_hat = generate(x, ids)
+        logits_real = D(h, ids)
+        logits_fake = D(h_hat, ids)
+        logits_fake_e = D(e_hat, ids)
+        d_loss = (
+            bce(logits_real, torch.ones_like(logits_real))
+            + bce(logits_fake, torch.zeros_like(logits_fake))
+            + args.gamma * bce(logits_fake_e, torch.zeros_like(logits_fake_e))
+        )
+        d_updated = d_loss.item() > args.d_threshold
+        if d_updated:
+            zero_all()
+            d_loss.backward()
+            opt_d.step()
+
+        history.append(
+            {
+                "iteration": it,
+                "g_loss": g_loss.item(),
+                "g_loss_u": loss_u.item(),
+                "g_loss_u_e": loss_u_e.item(),
+                "g_loss_s": loss_s.item(),
+                "g_loss_v": loss_v.item(),
+                "e_recon_mse": recon_mse.item(),
+                "d_loss": d_loss.item(),
+                "d_real_acc": (logits_real > 0).float().mean().item(),
+                "d_fake_acc": (logits_fake < 0).float().mean().item(),
+                "d_updated": int(d_updated),
+            }
+        )
+        if it % args.log_every == 0 or it == 1:
+            row = history[-1]
+            print(
+                f"[{it:>6}/{args.iterations}] d {row['d_loss']:.4f}  g_u {row['g_loss_u']:.4f}  "
+                f"g_s {row['g_loss_s']:.6f}  g_v {row['g_loss_v']:.4f}  "
+                f"recon {row['e_recon_mse']:.5f}  "
+                f"D acc real/fake {row['d_real_acc']:.2f}/{row['d_fake_acc']:.2f}  "
+                f"{time.perf_counter() - start:.1f} s"
+            )
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    seconds = time.perf_counter() - start
+    resources = {
+        "phase3_seconds": seconds,
+        "phase3_seconds_per_iteration": seconds / args.iterations,
+        "phase3_peak_vram_mb": peak_vram_mb(device),
+        "params_generator": count_parameters(G),
+        "params_discriminator": count_parameters(D),
+        "d_update_rate": float(np.mean([row["d_updated"] for row in history])),
+    }
+    return G, D, history, resources
 
 
 def save_losses(history, run_dir, filename="losses.csv"):
@@ -662,10 +904,36 @@ def main():
             baseline=(resources["val_persistence_mse"], "val persistence (next = current)"),
             filename="loss_curves_phase2.png",
         )
+        # Phase 3: joint training; E, R and S are updated in place.
+        G, D, history3, resources3 = train_joint(args, datasets, device, E, R, S)
+        resources.update(resources3)
+        save_losses(history3, run_dir, "losses_phase3.csv")
+        plot_losses(
+            history3,
+            run_dir,
+            [("g_loss_u", "generator (adversarial)"), ("d_loss", "discriminator")],
+            "TimeGAN phase 3: adversarial losses",
+            "BCE loss",
+            filename="loss_curves_phase3_adversarial.png",
+        )
+        plot_losses(
+            history3,
+            run_dir,
+            [
+                ("g_loss_s", "supervised (G/S)"),
+                ("e_recon_mse", "reconstruction (E/R)"),
+                ("g_loss_v", "moment (G)"),
+            ],
+            "TimeGAN phase 3: supervised, reconstruction and moment losses",
+            "loss",
+            filename="loss_curves_phase3_other.png",
+        )
         weights = {
             "embedder": E.state_dict(),
             "recovery": R.state_dict(),
             "supervisor": S.state_dict(),
+            "generator": G.state_dict(),
+            "discriminator": D.state_dict(),
         }
     print("resources: " + json.dumps(resources))
 
