@@ -19,4 +19,7 @@ data/
 *.pth
 *.pt
 *.ckpt
-runs/
+# Run outputs are ignored except each run's config.json (small, needed to reproduce it)
+runs/**
+!runs/**/
+!runs/**/config.json
