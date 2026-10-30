@@ -160,3 +160,130 @@ All runs use the same chronological splits (train 09:30–14:00, validation
   - The D-loss threshold (0.15) and the 2:1 schedule never acted: they only help when D is too *strong*.
   - At 0.47 s/iteration, the 10,000 iterations of the reference schedule would take ~80 min.
 - **What was tried next:** rerun phase 3 from the same checkpoint with a lower learning rate (1e-4), watching D's real/fake accuracy; if D then dominates, the threshold and 2:1 schedule become relevant. Any learning-rate change must also be applied to the RCGAN baseline for a fair comparison.
+
+### EXP-010 — TimeGAN phase 3 at lr 1e-4 (2,000 iterations from EXP-007), Kaggle T4
+- **Date:** 2026-10-30
+- **Commit:** training code as in 3b22cd0 (unchanged up to 3562a18)
+- **Model / representation:** full conditional TimeGAN, unconstrained, global min-max (0.5/99.5% bounds, winsorised), all five tickers
+- **Config:** identical to EXP-009 except **Adam lr 1e-4** for all networks (G, S, E, R, D): `--init-from runs/timegan_h164_k41_p12`, 2,000 phase 3 iterations, hidden 164, latent 41, batch 128, 2 G steps and 1 D step per iteration, D threshold 0.15, reference-code loss weights, seed 0; run name `timegan_h164_k41_p3_2k_lr1e-4`
+- **Compute:** Kaggle T4, same environment as EXP-006 to 009. Phase 3: 950 s = 0.47 s/iteration; peak VRAM 526 MB.
+- **Result:** **the discriminator is still stuck**; lowering the learning rate did not fix EXP-009.
+  - Mean losses per 250 iterations stay at the constant-output values: D loss 1.82-1.92, G adversarial loss 1.07-1.17. D accuracy on real latents 1-15%, on fake 98-100%; D updated on 100% of iterations. Same pattern as EXP-009 (lr 1e-3).
+  - What did train: moment loss 0.021 -> 0.017, supervised loss 0.0023 -> 0.0017, reconstruction MSE ~0.0001.
+  - Generated latents are less varied than real ones (on 4,096 training windows): std 0.081 for S(G(z)) vs 0.100 for real E(x), a mild sign of collapse.
+- **What went wrong / observations:** offline checks on this checkpoint (4,096 fixed training-split latents, Adam lr 1e-4, batch 128, the loop's 3-term D loss) show that D *can* learn, so the cause is not the learning rate, a bug in D, or a saturated network:
+  - a **fresh** hidden-164 D reached loss 1.65 / real accuracy 0.15 after 100 steps and 0.60 / 0.74 after 300;
+  - **this run's own trained D**, trained further on the same fixed latents, reached 1.05 / 0.57 after 100 steps and 0.78 / 0.73 after 300; its first GRU layer is far from saturation (mean |input pre-activation| 0.25, none above 5) and its first-step gradient norm is small (0.28), consistent with sitting on a flat region.
+  - (These accuracies are measured on latents from the training batches, so they show D's ability to learn, not generalisation; EXP-009's held-out check showed 99% for a small D.)
+  - The constant-output state is a slow plateau even on fixed targets (100-300 updates to leave it). In the loop, D gets one update per iteration while G and E each get two, so both the fake and the real latents move under it and it never escapes. The reference schedule (2 G steps per D step, skip D when its loss is below 0.15) is designed for a discriminator that is too *strong*, so here it works against training. This explanation fits all the evidence but is not yet confirmed inside the loop.
+  - Neither EXP-009 nor EXP-010 is a valid test of TimeGAN's adversarial training, because the adversarial part never worked.
+- **What was tried next:** `--d-steps` (discriminator updates per iteration; 1 reproduces the reference code exactly) added to both the TimeGAN and RCGAN loops and copied by `scripts/train_rcgan_matched.sh`; next run: phase 3 from the same checkpoint with more D steps per iteration.
+
+### EXP-011 — TimeGAN phase 3 with 5 D steps per iteration (lr 1e-4, 2,000 iterations from EXP-007), Kaggle T4
+- **Date:** 2026-10-30
+- **Commit:** 13f04bb (`--d-steps`)
+- **Model / representation:** full conditional TimeGAN, unconstrained, global min-max (0.5/99.5% bounds, winsorised), all five tickers
+- **Config:** as EXP-010 but **`--d-steps 5`**: per iteration 2 G+S / E+R steps and 5 D steps (each on a fresh batch); `--init-from runs/timegan_h164_k41_p12`, 2,000 phase 3 iterations (10,000 D updates in total), Adam lr 1e-4 for all networks, hidden 164, latent 41, batch 128, D threshold 0.15, reference-code loss weights, seed 0; run name `timegan_h164_k41_p3_2k_lr1e-4_d5`
+- **Compute:** Kaggle T4, same environment as EXP-006 to 010. Phase 3: 1,963 s (32.7 min) = **0.98 s/iteration** (about double EXP-010, from the extra D steps); peak VRAM 526 MB.
+- **Result:** a small improvement, but the discriminator still does not learn to separate real from generated latents.
+  - Mean D loss per 200 iterations 1.71-1.83 (EXP-010: 1.82-1.92; constant-output value 1.91); D accuracy on real latents 8-18% (EXP-010: 1-15%), on fake 93-100%; every D step applied (loss never below 0.15). G adversarial loss 1.03-1.20 (supervised fakes) and 1.24-1.70 (raw fakes), slightly above the constant-output value ln 3 ≈ 1.10, so D now gives fakes slightly lower scores than before.
+  - Other losses as in EXP-010: moment 0.023 -> 0.017, supervised 0.0024 -> 0.0018, reconstruction ~0.0001.
+- **What went wrong / observations:**
+  - **EXP-010's explanation was incomplete.** D received 10,000 updates here, far more than the 100-300 it needed in the offline tests, so "too few D updates on stable targets" cannot be the whole cause.
+  - **The generator undoes what D learns.** Offline test on this checkpoint (D and G+S trained in turns with the loop's exact losses, lr 1e-4, batch 128; separation measured on 512 held-out training windows as the logit gap mean D(real) - mean D(S(G(z))), 0 = no separation):
+
+    | Step | Logit gap | Balanced accuracy* |
+    |---|---|---|
+    | checkpoint as saved | +0.26 | 0.51 |
+    | after 50 D steps (G frozen) | +1.98 | 0.66 |
+    | after 150 D steps (G frozen) | +2.14 | 0.68 |
+    | then 1 G step (D frozen) | +2.09 | 0.63 |
+    | then 2 G steps | +1.59 | 0.60 |
+    | then 5 G steps | +1.09 | 0.55 |
+    | then 20 G steps | +0.70 | 0.54 |
+
+    \*threshold at the median generated logit, so a rough measure; the logit gap is the reliable number.
+
+    D builds separation at about +0.04 per update, while each generator update removes about 0.25: one G step undoes roughly what 5-10 D steps build. With 2 G steps per 5 D steps the generator still wins every round, so D never holds a lasting advantage.
+  - This also corrects an earlier claim (EXP-009/010 discussion): the generator does *not* receive "almost no" adversarial gradient. It receives enough to escape whatever direction D has just learned, yet a fresh discriminator still separates its output from real data (EXP-009: 99%). The generator chases the current discriminator's weak spots instead of matching the real distribution, a classic GAN non-convergence pattern. The reduced variety of generated latents (EXP-010) fits this: nothing in the current loop rewards diversity.
+  - The imbalance is per update, in favour of the generator; more generator steps would make it worse.
+- **What was tried next:** `--d-lr` (separate discriminator learning rate, default `--lr`), so D can learn on a faster time scale than G, the two time-scale update rule (Heusel et al., 2017); also copied by `scripts/train_rcgan_matched.sh`. Next run: e.g. `--lr 1e-5 --d-lr 1e-4 --d-steps 5` from the same checkpoint (note that `--lr` also slows E, R and S, which are only fine-tuned in phase 3).
+
+### EXP-012 — TimeGAN phase 3 with a faster discriminator (TTUR) + first full benchmark, Kaggle T4
+- **Date:** 2026-10-30
+- **Commit:** 8065fb4 (`--d-lr`)
+- **Model / representation:** full conditional TimeGAN, unconstrained, global min-max (0.5/99.5% bounds, winsorised), all five tickers
+- **Config:** as EXP-011 but with the two time-scale update rule (Heusel et al., 2017): **`--lr 1e-5` for G, S, E and R, `--d-lr 1e-4` for D**, `--d-steps 5`, 2 G steps per iteration; `--init-from runs/timegan_h164_k41_p12`, 2,000 phase 3 iterations, hidden 164, latent 41, batch 128, D threshold 0.15, reference-code loss weights, seed 0; run name `timegan_h164_k41_p3_2k_ttur`. Benchmark: `predict.py` with defaults (32 sequences x 500 steps per ticker, scored against the real test hour; reference = real validation hour vs test hour, 7 segments of 500 steps).
+- **Compute:** training on the Kaggle T4: phase 3 1,961 s (32.7 min) = 0.98 s/iteration, peak VRAM 783 MB; with phases 1 and 2 (EXP-007, 17.4 min) the full model took ~50 min. Generation (on a CPU): 2.2 s for all 160 sequences = 73 sequences/s.
+- **Result (training):** **the adversarial game works for the first time.** Per 200 iterations, D loss fell from 1.46 to 0.41-0.70 (constant-output value 1.91) and D's accuracy on real latents rose from 39% to 78-88% while staying at 94-99% on fakes. G's adversarial loss rose from 1.05 to 2.5-3.0, i.e. G now gets real feedback and D is ahead. The D threshold acted for the first time (99.3% of D steps applied; some skipped around iterations 600-800). Costs of the slower generator: the supervised loss stayed at 0.0025-0.0029 (EXP-011: 0.0018) and the moment loss at 0.021-0.024 (EXP-011: 0.017). Reconstruction ~0.0001. No NaNs.
+- **Result (generated books): poor, and far from the acceptance criteria.**
+
+  | Ticker | Violations (crossed / ladder) | Spread ticks gen / real | Return std gen / real | ACF r lag 1 gen / real | ACF \|r\| lag 1 / 60 gen (real lag 1) | KL spread gen (ref) | KL mid change gen (ref) | SSIM gen (ref) |
+  |---|---|---|---|---|---|---|---|---|
+  | AMZN | 0% / **80%** | 15.3 / 9.9 | 2.4e-6 / 8.9e-5 | +0.90 / +0.07 | 0.90 / 0.60 (0.13) | 16.0 (0.26) | 5.7 (0.17) | 0.20 (0.10) |
+  | AAPL | 0% / 0% | 7.3 / 11.1 | 3.6e-6 / 6.3e-5 | +0.90 / +0.09 | 0.91 / 0.10 (0.11) | 12.2 (0.12) | 8.2 (0.14) | 0.06 (0.04) |
+  | GOOG | 0% / **26%** | 26.0 / 21.6 | 1.7e-6 / 6.0e-5 | +0.80 / +0.02 | 0.80 / 0.10 (0.10) | 12.7 (0.14) | 19.1 (0.17) | 0.18 (0.12) |
+  | INTC | 0% / 0% | 1.00 / 1.01 | 6.6e-6 / 8.1e-5 | +0.96 / +0.01 | 0.96 / 0.66 (0.04) | 0.10 (0.00) | 0.81 (0.02) | 0.26 (0.27) |
+  | MSFT | 0% / 0% | 1.00 / 1.01 | 4.6e-6 / 9.0e-5 | +0.93 / -0.01 | 0.94 / 0.61 (0.05) | 0.21 (0.00) | 1.18 (0.04) | 0.46 (0.43) |
+
+  - **Smooth deterministic drift instead of price dynamics.** The VWAP-path figure shows each generated mid moving in a smooth, almost straight line (AMZN -$1.1, GOOG -$4.6, AAPL +$4.8 over 500 s), with the three plotted samples per ticker practically on top of each other. Returns are 13-35x smaller in standard deviation than real, have excess kurtosis of -0.9 to 4.4 (real 18-41) and lag-1 autocorrelation of +0.80 to +0.96 (real about 0). The high ACF of |returns| is therefore an artefact of the steady drift, not volatility clustering. Within-sequence VWAP variance is 3-23x too high for the same reason.
+  - **The generator largely ignores its noise:** different noise gives almost the same sequence (mode collapse to one trajectory per ticker).
+  - **Static books:** depth heatmaps are smooth horizontal bands close to each ticker's average book, with none of the real order-flow texture.
+  - **Validity degrades with horizon:** no crossed books and no negative sizes anywhere, but ladder violations for AMZN and GOOG rise from 1% / 0% in the first 100 steps to 100% in the last 100, as the drifting offsets eventually break the ordering.
+  - **Prices are off the tick grid:** mean distance from the nearest tick 0.23-0.25 ticks (real 0; uniformly random prices 0.25).
+  - **What works:** the ticker condition separates the two market regimes. INTC and MSFT have a one-tick spread on 100% of steps (real 99%) and AMZN / AAPL / GOOG keep wide spreads (7-26 ticks), so there is no ticker collapse, though AAPL's spread is too narrow and AMZN's too wide.
+  - **Spec metrics:** KL is 15-100x the real-vs-real reference, mainly because continuous, drifting prices never reproduce the tick-discrete spread and mid-change distributions. SSIM is *at or above* the real-vs-real reference for every ticker even though the books are clearly unrealistic: smooth average heatmaps resemble any real heatmap at least as much as two real hours resemble each other. This is direct evidence for the README's critique of SSIM.
+  - **Against the acceptance criteria:** 1 (violations < 1%) fails for AMZN and GOOG; 2 (conditioning) partly met (regimes distinct, levels off); 3 (volatility clustering) fails; 4 reported, far from reference; 5 (< 30 min) fails (~50 min).
+  - Compared with EXP-009 (same benchmark, constant D): EXP-009's returns jittered from step to step (lag-1 ACF -0.17 to -0.74) around a drift; here they are smooth. Ladder violations: AMZN 66% -> 80%, GOOG 60% -> 26%, AAPL 6% -> 0%. Neither run reproduces real price dynamics.
+- **What went wrong / observations (hypotheses, not yet tested):**
+  - **Long horizon:** training windows are 24 steps, generation is 500. A small constant bias in the generated return, compounded over 500 steps, gives exactly this kind of steady drift; validity is fine early and breaks late. Benchmarking at 24 steps would separate "cannot generate" from "cannot extrapolate"; the planned 128-step training windows are directly relevant.
+  - **Heavy tails removed by preprocessing:** returns are winsorised at the 0.5/99.5% training quantiles, so the largest moves never appear in the training data, and a sigmoid generator cannot exceed them. This alone limits kurtosis (the open decision from the normalisation step).
+  - **Undertrained generator:** at lr 1e-5 for 2,000 iterations, G (and S) moved little; its adversarial feedback only became meaningful in this run, and D is ahead at the end.
+  - **No reward for diversity:** the moment loss matches only per-step means and spreads across the batch, and a discriminator that is ahead but sees one sequence at a time does not directly penalise every sample being the same.
+  - **Continuous prices:** the unconstrained decoder does not round to the tick grid; tick-aware decoding (or the constrained representation for the ladder) would address the off-grid prices and part of the KL.
+- **Follow-up: horizon check.** The same checkpoint benchmarked at its 24-step training length (`predict.py --seq-len 24 --n-samples 128`, CPU; the real-vs-real reference is then cut into 24-step segments, so these numbers are not comparable with the 500-step table): **0% violations for every ticker** (500 steps: AMZN 80%, GOOG 26%), but return std still 7-35x smaller than real (e.g. AMZN 2.7e-6 vs 8.9e-5). So the broken ladders are a long-horizon effect, while the damped price dynamics are already present within the training length.
+- **What was tried next:** one final run set, with a longer training window (targets the horizon failure) and a faster generator learning rate (targets undertraining), followed by the RCGAN baseline trained with identical settings (`scripts/train_rcgan_matched.sh`). Return clipping was left unchanged so the final run changes as little as possible.
+
+### EXP-013 — Final TimeGAN: 64-step windows, TTUR, trained from scratch, Kaggle T4
+- **Date:** 2026-10-30
+- **Commit:** 50e3dbf
+- **Model / representation:** full conditional TimeGAN, unconstrained, global min-max (0.5/99.5% bounds, winsorised), all five tickers
+- **Config:** **seq len 64** (80,680 / 17,685 / 17,685 train/val/test windows), hidden 164, latent 41, layers 3 (supervisor 2), cond dim 8, z dim 41 (U(0,1)), batch 128; 20,000 phase 1 + 5,000 phase 2 + 2,000 phase 3 iterations; **`--lr 3e-5`** (G, S, E, R) and **`--d-lr 1e-4`** (D); 2 G steps and 5 D steps per iteration, D threshold 0.15, reference-code loss weights, seed 0; run name `final_timegan`. Benchmark: `predict.py` on the GPU, 32 x 500-step sequences per ticker against the test hour, plus the same at the 64-step training length (`eval_64`).
+- **Compute:** Kaggle T4 (Python 3.13.15, PyTorch 2.11.0+cu128). Phase 1 1,931 s (0.097 s/it, peak VRAM 3,509 MB), phase 2 319 s (0.064 s/it, 2,916 MB), phase 3 4,980 s (2.49 s/it, 1,213 MB): **120.5 min in total**. Params E 437,305 / R 437,305 / S 274,945 / G 437,305 / D 1,184,121. The phase 1 and 2 peaks come mostly from computing validation loss on 2,048 64-step windows in one batch. Generation: 0.84 s for 160 x 500 steps (190 sequences/s, 224 MB).
+- **Result (training):**
+  - **Phase 1 underfitted: val reconstruction 0.0045 after 20,000 iterations** (EXP-007: 0.0001), per ticker only 1.1-1.3x better than each ticker's own mean (AMZN 0.0069 vs 0.0088), i.e. back at EXP-003/004 quality. Cause: `--lr` sets the learning rate of every phase, so phases 1 and 2 ran at 3e-5 instead of the 1e-3 used in EXP-007 (33x slower). The intent was to slow only the phase 3 fine-tuning of G/S/E/R; that is only true with `--init-from`. This was an error in the command (suggested by the AI assistant, not caught before the run).
+  - Phase 2: supervisor beats persistence for every ticker by 1.8-2.6x (val 0.00119 vs 0.00218 pooled).
+  - Phase 3: adversarial training active throughout. Per 250 iterations, D loss 0.89-1.53, D accuracy on real 33-74% and on fake 84-95%, G adversarial loss 1.38-2.04; every D step applied. Moment loss 0.041 -> 0.020, reconstruction MSE ~0.0047. No NaNs.
+- **Result (generated books, 500 steps):**
+
+  | Ticker | Violations | Spread ticks gen / real | VWAP var gen / real ($²) | VWAP-mid ticks gen / real | Return std gen / real | ACF r lag 1 gen / real | Kurtosis gen / real | KL spread (ref) | KL mid (ref) | SSIM (ref) |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | AMZN | **0.0%** | 16.5 / 9.9 | 0.023 / 0.023 | -0.64 / -1.41 | 8.2e-6 / 8.9e-5 | +0.61 / +0.07 | 47.6 / 41.4 | 15.5 (0.26) | 2.9 (0.17) | 0.14 (0.10) |
+  | AAPL | **0.0%** | 12.1 / 11.1 | 0.052 / 0.081 | -2.44 / -1.77 | 7.8e-6 / 6.3e-5 | +0.79 / +0.09 | 67.4 / 38.5 | 12.6 (0.12) | 6.4 (0.14) | 0.11 (0.04) |
+  | GOOG | **0.0%** | 24.1 / 21.6 | 0.049 / 0.125 | -0.26 / -3.04 | 6.5e-6 / 6.0e-5 | +0.92 / +0.02 | 2.0 / 18.5 | 13.3 (0.13) | 3.3 (0.17) | 0.19 (0.12) |
+  | INTC | **0.0%** | 1.00 / 1.01 | 0.018 / 0.0004 | -0.42 / -0.34 | 7.4e-6 / 8.1e-5 | +0.93 / +0.01 | 7.6 / 23.8 | 0.10 (0.00) | 0.81 (0.02) | 0.34 (0.27) |
+  | MSFT | **0.0%** | 1.00 / 1.01 | 0.044 / 0.0003 | -0.01 / +0.03 | 1.0e-5 / 8.9e-5 | +0.81 / -0.01 | 6.8 / 20.2 | 0.21 (0.00) | 1.11 (0.04) | 0.54 (0.43) |
+
+  - **No invariant violations at all**, for every ticker and at every horizon (0% in both the first and the last 100 steps; also 0% at 64 steps). INTC/MSFT one-tick spread on 100% of steps (real 99%); AMZN/AAPL/GOOG wide spreads, AAPL and GOOG close to real, AMZN 67% too wide. VWAP variance matches real for AMZN, is 36-61% too low for AAPL/GOOG and 40-140x too high for INTC/MSFT (drift).
+  - **Still no realistic price dynamics:** mid prices follow smooth curves (VWAP-path figure), returns are 8-11x too small in standard deviation with lag-1 ACF of +0.61 to +0.93, and different noise gives near-identical paths. The ACF of |returns| (0.79-0.95 at lag 1) is again an artefact of smooth drift. Prices are off the tick grid (0.25 ticks). KL is 15-100x the reference; SSIM at or above it for every ticker.
+- **What went wrong / observations:**
+  - The learning-rate slip means the final TimeGAN is confounded: its latent space is much weaker than EXP-007's, and every generated book is decoded through that weaker recovery network. Several changes happened at once compared with EXP-012 (window 24 -> 64, G lr 1e-5 -> 3e-5, weaker autoencoder, trained from scratch), so the improvement in validity cannot be attributed to one of them. The 24-step check in EXP-012 points to the longer window for the long-horizon ladder breakage.
+  - At 120 min and a measured 3.5 GB peak, the run fails feasibility criterion 5 (< 30 min, < 2 GB), though phase 3 training itself peaked at 1.2 GB.
+- **What was tried next:** the matched RCGAN baseline (EXP-014). Not done for lack of time: phases 1 and 2 at lr 1e-3 with phase 3 at the final settings (would remove the confound), and repeated seeds.
+
+### EXP-014 — Final RCGAN baseline, settings matched to EXP-013, Kaggle T4
+- **Date:** 2026-10-30
+- **Commit:** 50e3dbf (`scripts/train_rcgan_matched.sh runs/final_timegan`)
+- **Model / representation:** conditional RCGAN-style baseline (generator and discriminator on features), unconstrained, global min-max, all five tickers
+- **Config:** every shared setting copied from EXP-013's `config.json`: seq len 64, hidden 164, layers 3, cond dim 8, z dim 41, batch 128, 2,000 iterations (= TimeGAN phase 3), `--lr 3e-5`, `--d-lr 1e-4`, 2 G steps and 5 D steps per iteration, D threshold 0.15, seed 0; run name `rcgan_matched_final_timegan`. Benchmark as EXP-013.
+- **Compute:** Kaggle T4, same environment. 2,053 s (34.2 min) = 1.03 s/iteration, peak VRAM 1,150 MB. Params G 437,305 / D 1,184,121 (identical to TimeGAN's G and D). Generation 0.36 s for 160 x 500 steps (448 sequences/s).
+- **Result (training):** **the discriminator dominated from the start.** Per 250 iterations, D loss 0.075-0.18, D accuracy 96-99% on real and 99-100% on fake; G loss 3.2-3.6. Because D's loss was mostly below the 0.15 threshold, only **10.7% of D steps were applied** (the threshold doing its job). No NaNs.
+- **Result (generated books):** unusable for every ticker.
+  - **100% ladder violations**, from the first step to the last (no crossed books); also 100% at 64 steps.
+  - Spreads far too wide: 35-93 ticks for AMZN/AAPL/GOOG (real 10-22) and 4-5 ticks for INTC/MSFT (real 1; one-tick share 0%), so the regime difference is only partly kept. VWAP sits 36-95 ticks *above* the mid (real -3 to 0).
+  - Inspected book (AAPL, step 250): 2-7 shares at most levels and one order of ~3,800 shares at the third ask level; bid prices out of order; the mid had drifted from $581.9 to about $626 (+$44). Mid paths are smooth and near-identical across noise (lag-1 return ACF +0.96-0.97, return std 65-99x too small).
+  - Depth heatmaps are almost empty except one band; SSIM is negative or near 0 (-0.04 to 0.04). KL 18-22.
+- **What went wrong / observations:**
+  - With TimeGAN's settings, the baseline's discriminator (which sees raw features rather than learned latents) wins easily, and the adversarial loss alone gives the generator no route to valid books. The settings were tuned (EXP-009 to 012) for TimeGAN's latent-space discriminator, and the faster D learning rate (TTUR) suited that case; for the baseline it makes D overwhelming. The comparison is fair in the sense of identical settings and tuning effort, but not tuned separately for the baseline, which is a limitation to report.
+  - Comparison with EXP-013 on identical splits and settings: TimeGAN 0% violations vs RCGAN 100%; TimeGAN keeps the one-tick regime for INTC/MSFT, RCGAN does not; neither reproduces realistic returns.
+- **What was tried next:** results written up in the README (Sections 7, 10 and 11).
