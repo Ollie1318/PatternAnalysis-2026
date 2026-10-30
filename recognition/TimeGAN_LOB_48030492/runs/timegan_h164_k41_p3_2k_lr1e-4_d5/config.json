@@ -1,0 +1,112 @@
+{
+  "model": "timegan",
+  "data_dir": "data",
+  "tickers": [
+    "AMZN",
+    "AAPL",
+    "GOOG",
+    "INTC",
+    "MSFT"
+  ],
+  "representation": "unconstrained",
+  "step": 1.0,
+  "scope": "global",
+  "quantile": 0.005,
+  "seq_len": 24,
+  "stride": 1,
+  "hidden_dim": 164,
+  "num_layers": 3,
+  "cond_dim": 8,
+  "latent_dim": 41,
+  "z_dim": null,
+  "noise": "uniform",
+  "iterations": 2000,
+  "ae_iterations": null,
+  "sup_iterations": null,
+  "init_from": "runs/timegan_h164_k41_p12",
+  "val_windows": 2048,
+  "batch_size": 128,
+  "lr": 0.0001,
+  "g_steps": 2,
+  "d_steps": 5,
+  "d_threshold": 0.15,
+  "gamma": 1.0,
+  "sup_weight": 100.0,
+  "moment_weight": 100.0,
+  "e_sup_weight": 0.1,
+  "balanced": false,
+  "device": "cuda",
+  "seed": 0,
+  "out_dir": "runs",
+  "run_name": "timegan_h164_k41_p3_2k_lr1e-4_d5",
+  "log_every": 50,
+  "torch_version": "2.11.0+cu128",
+  "resources": {
+    "init_from": "runs/timegan_h164_k41_p12",
+    "init_resources": {
+      "phase1_seconds": 782.1101123250005,
+      "phase1_seconds_per_iteration": 0.03910550561625002,
+      "phase1_peak_vram_mb": 1371.30615234375,
+      "params_embedder": 437305,
+      "params_recovery": 437305,
+      "val_predict_mean_mse": 0.0810328796505928,
+      "final_val_recon_mse": 9.969874372472987e-05,
+      "final_val_by_ticker": {
+        "AMZN": {
+          "recon_mse": 0.00013053417205810547,
+          "predict_mean_mse": 0.008817100897431374
+        },
+        "AAPL": {
+          "recon_mse": 0.00014453349285759032,
+          "predict_mean_mse": 0.008338761515915394
+        },
+        "GOOG": {
+          "recon_mse": 0.00017337217286694795,
+          "predict_mean_mse": 0.009480062872171402
+        },
+        "INTC": {
+          "recon_mse": 2.9570677725132555e-05,
+          "predict_mean_mse": 0.0006109979003667831
+        },
+        "MSFT": {
+          "recon_mse": 2.0421504814294167e-05,
+          "predict_mean_mse": 0.0006050111260265112
+        }
+      },
+      "phase2_seconds": 261.3001062050007,
+      "phase2_seconds_per_iteration": 0.02613001062050007,
+      "phase2_peak_vram_mb": 1135.3583984375,
+      "params_supervisor": 274945,
+      "val_persistence_mse": 0.0023759875912219286,
+      "final_val_sup_mse": 0.001995048951357603,
+      "final_val_sup_by_ticker": {
+        "AMZN": {
+          "sup_mse": 0.002446032129228115,
+          "persistence_mse": 0.0027357458602637053
+        },
+        "AAPL": {
+          "sup_mse": 0.0037061304319649935,
+          "persistence_mse": 0.0044547272846102715
+        },
+        "GOOG": {
+          "sup_mse": 0.002864714479073882,
+          "persistence_mse": 0.003242650767788291
+        },
+        "INTC": {
+          "sup_mse": 0.00039275240851566195,
+          "persistence_mse": 0.0006018826388753951
+        },
+        "MSFT": {
+          "sup_mse": 0.0005658789305016398,
+          "persistence_mse": 0.0008456740179099143
+        }
+      }
+    },
+    "phase3_seconds": 1963.41024058,
+    "phase3_seconds_per_iteration": 0.98170512029,
+    "phase3_peak_vram_mb": 526.41357421875,
+    "params_generator": 437305,
+    "params_discriminator": 1184121,
+    "d_update_rate": 1.0
+  }
+}

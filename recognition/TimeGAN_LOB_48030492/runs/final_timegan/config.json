@@ -1,0 +1,110 @@
+{
+  "model": "timegan",
+  "data_dir": "data",
+  "tickers": [
+    "AMZN",
+    "AAPL",
+    "GOOG",
+    "INTC",
+    "MSFT"
+  ],
+  "representation": "unconstrained",
+  "step": 1.0,
+  "scope": "global",
+  "quantile": 0.005,
+  "seq_len": 64,
+  "stride": 1,
+  "hidden_dim": 164,
+  "num_layers": 3,
+  "cond_dim": 8,
+  "latent_dim": 41,
+  "z_dim": null,
+  "noise": "uniform",
+  "iterations": 2000,
+  "ae_iterations": 20000,
+  "sup_iterations": 5000,
+  "init_from": null,
+  "val_windows": 2048,
+  "batch_size": 128,
+  "lr": 3e-05,
+  "d_lr": 0.0001,
+  "g_steps": 2,
+  "d_steps": 5,
+  "d_threshold": 0.15,
+  "gamma": 1.0,
+  "sup_weight": 100.0,
+  "moment_weight": 100.0,
+  "e_sup_weight": 0.1,
+  "balanced": false,
+  "device": "cuda",
+  "seed": 0,
+  "out_dir": "runs",
+  "run_name": "final_timegan",
+  "log_every": 50,
+  "torch_version": "2.11.0+cu128",
+  "resources": {
+    "phase1_seconds": 1931.4615592549999,
+    "phase1_seconds_per_iteration": 0.09657307796275,
+    "phase1_peak_vram_mb": 3509.25146484375,
+    "params_embedder": 437305,
+    "params_recovery": 437305,
+    "val_predict_mean_mse": 0.0810059979557991,
+    "final_val_recon_mse": 0.004487968515604734,
+    "final_val_by_ticker": {
+      "AMZN": {
+        "recon_mse": 0.00688693905249238,
+        "predict_mean_mse": 0.008830245584249496
+      },
+      "AAPL": {
+        "recon_mse": 0.007207869086414576,
+        "predict_mean_mse": 0.00835986714810133
+      },
+      "GOOG": {
+        "recon_mse": 0.0072937519289553165,
+        "predict_mean_mse": 0.009481888264417648
+      },
+      "INTC": {
+        "recon_mse": 0.0005722498171962798,
+        "predict_mean_mse": 0.0006051588570699096
+      },
+      "MSFT": {
+        "recon_mse": 0.00047611870104447007,
+        "predict_mean_mse": 0.000600641593337059
+      }
+    },
+    "phase2_seconds": 318.60017276100007,
+    "phase2_seconds_per_iteration": 0.06372003455220002,
+    "phase2_peak_vram_mb": 2916.28076171875,
+    "params_supervisor": 274945,
+    "val_persistence_mse": 0.00217969948425889,
+    "final_val_sup_mse": 0.0011913544731214643,
+    "final_val_sup_by_ticker": {
+      "AMZN": {
+        "sup_mse": 0.0014633971732109785,
+        "persistence_mse": 0.0025708472821861506
+      },
+      "AAPL": {
+        "sup_mse": 0.0017724897479638457,
+        "persistence_mse": 0.003392669837921858
+      },
+      "GOOG": {
+        "sup_mse": 0.0019963576924055815,
+        "persistence_mse": 0.003330244915559888
+      },
+      "INTC": {
+        "sup_mse": 0.0003223730018362403,
+        "persistence_mse": 0.0008210586966015399
+      },
+      "MSFT": {
+        "sup_mse": 0.00040145235834643245,
+        "persistence_mse": 0.0007833209238015115
+      }
+    },
+    "phase3_seconds": 4980.328197678,
+    "phase3_seconds_per_iteration": 2.490164098839,
+    "phase3_peak_vram_mb": 1212.8427734375,
+    "params_generator": 437305,
+    "params_discriminator": 1184121,
+    "d_update_rate": 1.0
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "model": "timegan",
+  "data_dir": "data",
+  "tickers": [
+    "AMZN",
+    "AAPL",
+    "GOOG",
+    "INTC",
+    "MSFT"
+  ],
+  "representation": "unconstrained",
+  "step": 1.0,
+  "scope": "global",
+  "quantile": 0.005,
+  "seq_len": 24,
+  "stride": 1,
+  "hidden_dim": 24,
+  "num_layers": 3,
+  "cond_dim": 0,
+  "latent_dim": null,
+  "z_dim": null,
+  "noise": "uniform",
+  "iterations": 2000,
+  "ae_iterations": 10000,
+  "val_windows": 2048,
+  "batch_size": 128,
+  "lr": 0.001,
+  "g_steps": 2,
+  "d_threshold": 0.15,
+  "balanced": false,
+  "device": "cuda",
+  "seed": 0,
+  "out_dir": "runs",
+  "run_name": "ae-uncond-test1",
+  "log_every": 50,
+  "torch_version": "2.14.1+cu126",
+  "resources": {
+    "phase1_seconds": 51.81577646200003,
+    "phase1_seconds_per_iteration": 0.005181577646200003,
+    "peak_vram_mb": 260.7431640625,
+    "params_embedder": 12624,
+    "params_recovery": 11825,
+    "val_predict_mean_mse": 0.0810328796505928,
+    "final_val_recon_mse": 0.005158967804163694,
+    "final_val_by_ticker": {
+      "AMZN": {
+        "recon_mse": 0.007918784394860268,
+        "predict_mean_mse": 0.008817100897431374
+      },
+      "AAPL": {
+        "recon_mse": 0.007829134352505207,
+        "predict_mean_mse": 0.008338761515915394
+      },
+      "GOOG": {
+        "recon_mse": 0.008850480429828167,
+        "predict_mean_mse": 0.009480062872171402
+      },
+      "INTC": {
+        "recon_mse": 0.0006636230973526835,
+        "predict_mean_mse": 0.0006109979003667831
+      },
+      "MSFT": {
+        "recon_mse": 0.0005283672362565994,
+        "predict_mean_mse": 0.0006050111260265112
+      }
+    }
+  }
+}

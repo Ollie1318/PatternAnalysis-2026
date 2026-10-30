@@ -1,0 +1,97 @@
+{
+  "model": "timegan",
+  "data_dir": "data",
+  "tickers": [
+    "AMZN",
+    "AAPL",
+    "GOOG",
+    "INTC",
+    "MSFT"
+  ],
+  "representation": "unconstrained",
+  "step": 1.0,
+  "scope": "global",
+  "quantile": 0.005,
+  "seq_len": 24,
+  "stride": 1,
+  "hidden_dim": 64,
+  "num_layers": 3,
+  "cond_dim": 8,
+  "latent_dim": 24,
+  "z_dim": null,
+  "noise": "uniform",
+  "iterations": 2000,
+  "ae_iterations": 10000,
+  "sup_iterations": 1,
+  "val_windows": 2048,
+  "batch_size": 128,
+  "lr": 0.001,
+  "g_steps": 2,
+  "d_threshold": 0.15,
+  "balanced": false,
+  "device": "cuda",
+  "seed": 0,
+  "out_dir": "runs",
+  "run_name": "ae_sweep_h64_k24",
+  "log_every": 50,
+  "torch_version": "2.11.0+cu128",
+  "resources": {
+    "phase1_seconds": 68.23473047899995,
+    "phase1_seconds_per_iteration": 0.006823473047899995,
+    "phase1_peak_vram_mb": 580.580078125,
+    "params_embedder": 73600,
+    "params_recovery": 71441,
+    "val_predict_mean_mse": 0.0810328796505928,
+    "final_val_recon_mse": 0.003403502982109785,
+    "final_val_by_ticker": {
+      "AMZN": {
+        "recon_mse": 0.005230364389717579,
+        "predict_mean_mse": 0.008817100897431374
+      },
+      "AAPL": {
+        "recon_mse": 0.0056818402372300625,
+        "predict_mean_mse": 0.008338761515915394
+      },
+      "GOOG": {
+        "recon_mse": 0.005548844113945961,
+        "predict_mean_mse": 0.009480062872171402
+      },
+      "INTC": {
+        "recon_mse": 0.0003393008082639426,
+        "predict_mean_mse": 0.0006109979003667831
+      },
+      "MSFT": {
+        "recon_mse": 0.00021524925250560045,
+        "predict_mean_mse": 0.0006050111260265112
+      }
+    },
+    "phase2_seconds": 0.01715651699987575,
+    "phase2_seconds_per_iteration": 0.01715651699987575,
+    "phase2_peak_vram_mb": 475.5361328125,
+    "params_supervisor": 45376,
+    "val_persistence_mse": 0.004047905094921589,
+    "final_val_sup_mse": 0.04669630527496338,
+    "final_val_sup_by_ticker": {
+      "AMZN": {
+        "sup_mse": 0.04032381251454353,
+        "persistence_mse": 0.004358523525297642
+      },
+      "AAPL": {
+        "sup_mse": 0.03646491467952728,
+        "persistence_mse": 0.005963179282844067
+      },
+      "GOOG": {
+        "sup_mse": 0.04268581420183182,
+        "persistence_mse": 0.0054166316986083984
+      },
+      "INTC": {
+        "sup_mse": 0.06289645284414291,
+        "persistence_mse": 0.0017178714042529464
+      },
+      "MSFT": {
+        "sup_mse": 0.051125068217515945,
+        "persistence_mse": 0.0027823077980428934
+      }
+    }
+  }
+}
