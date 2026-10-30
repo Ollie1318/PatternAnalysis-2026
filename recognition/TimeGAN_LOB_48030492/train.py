@@ -116,7 +116,14 @@ def parse_args():
         help="validation windows used to track the phase 1 and 2 losses",
     )
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate for every network")
+    p.add_argument(
+        "--d-lr",
+        type=float,
+        default=None,
+        help="discriminator learning rate (default: --lr). A faster D than G is the two "
+        "time-scale update rule (Heusel et al. 2017), see EXP-011",
+    )
     p.add_argument("--g-steps", type=int, default=2, help="generator steps per iteration")
     p.add_argument(
         "--d-steps",
@@ -260,7 +267,7 @@ def train_rcgan(args, datasets, device):
         feature_dim, n_tickers, args.cond_dim, args.hidden_dim, args.num_layers
     ).to(device)
     opt_g = torch.optim.Adam(G.parameters(), lr=args.lr)
-    opt_d = torch.optim.Adam(D.parameters(), lr=args.lr)
+    opt_d = torch.optim.Adam(D.parameters(), lr=args.d_lr or args.lr)
     bce = nn.BCEWithLogitsLoss()  # mean over batch and time steps
 
     loader = make_dataloader(
@@ -742,7 +749,8 @@ def train_joint(args, datasets, device, E, R, S):
 
     opt_gs = torch.optim.Adam(list(G.parameters()) + list(S.parameters()), lr=args.lr)
     opt_er = torch.optim.Adam(list(E.parameters()) + list(R.parameters()), lr=args.lr)
-    opt_d = torch.optim.Adam(D.parameters(), lr=args.lr)
+    # D may learn faster than the other networks (two time-scale update rule, --d-lr).
+    opt_d = torch.optim.Adam(D.parameters(), lr=args.d_lr or args.lr)
     bce = nn.BCEWithLogitsLoss()  # mean over batch and time steps
     mse = nn.MSELoss()
 
